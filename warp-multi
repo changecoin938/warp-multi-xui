@@ -27,6 +27,12 @@ WG_PREFIX_DEFAULT="warp"
 WGCF_VERSION_DEFAULT="2.2.22"
 GOST_VERSION_DEFAULT="2.11.5"
 
+# wgcf register rate-limit handling (Cloudflare may return 429 if you create many accounts fast)
+REGISTER_DELAY_DEFAULT=8          # seconds to wait between successful registrations
+REGISTER_RETRIES_DEFAULT=8        # retries when 429 happens
+REGISTER_BACKOFF_BASE_DEFAULT=15  # exponential backoff base seconds (15,30,60,120,...)
+REGISTER_BACKOFF_MAX_DEFAULT=900  # max backoff seconds
+
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -35,11 +41,29 @@ require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (sudo -i)";
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+ensure_defaults() {
+  COUNT="${COUNT:-$COUNT_DEFAULT}"
+  BASE_PORT="${BASE_PORT:-$BASE_PORT_DEFAULT}"
+  BASE_NET="${BASE_NET:-$BASE_NET_DEFAULT}"
+  NS_PREFIX="${NS_PREFIX:-$NS_PREFIX_DEFAULT}"
+  WG_PREFIX="${WG_PREFIX:-$WG_PREFIX_DEFAULT}"
+  UPLINK_IF="${UPLINK_IF:-}"
+
+  WGCF_VERSION="${WGCF_VERSION:-$WGCF_VERSION_DEFAULT}"
+  GOST_VERSION="${GOST_VERSION:-$GOST_VERSION_DEFAULT}"
+
+  REGISTER_DELAY="${REGISTER_DELAY:-$REGISTER_DELAY_DEFAULT}"
+  REGISTER_RETRIES="${REGISTER_RETRIES:-$REGISTER_RETRIES_DEFAULT}"
+  REGISTER_BACKOFF_BASE="${REGISTER_BACKOFF_BASE:-$REGISTER_BACKOFF_BASE_DEFAULT}"
+  REGISTER_BACKOFF_MAX="${REGISTER_BACKOFF_MAX:-$REGISTER_BACKOFF_MAX_DEFAULT}"
+}
+
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
   fi
+  ensure_defaults
 }
 
 save_config() {
@@ -53,6 +77,10 @@ WG_PREFIX=${WG_PREFIX}
 UPLINK_IF=${UPLINK_IF}
 WGCF_VERSION=${WGCF_VERSION}
 GOST_VERSION=${GOST_VERSION}
+REGISTER_DELAY=${REGISTER_DELAY}
+REGISTER_RETRIES=${REGISTER_RETRIES}
+REGISTER_BACKOFF_BASE=${REGISTER_BACKOFF_BASE}
+REGISTER_BACKOFF_MAX=${REGISTER_BACKOFF_MAX}
 EOFCONF
 }
 
@@ -169,13 +197,44 @@ gen_warp_conf() {
   fi
 
   log "Generating WARP config #$i ..."
-  (
+  if ! (
+    set -euo pipefail
     cd "$dir"
+    umask 077
     rm -f wgcf-account.toml wgcf-profile.conf
-    wgcf register --accept-tos >/dev/null
-    wgcf generate >/dev/null
+
+    attempt=1
+    while true; do
+      out="$(wgcf register --accept-tos 2>&1)" && break
+
+      if echo "$out" | grep -q '429 Too Many Requests'; then
+        if [[ "$attempt" -ge "$REGISTER_RETRIES" ]]; then
+          echo "$out" >&2
+          exit 42
+        fi
+
+        sleep_s=$(( REGISTER_BACKOFF_BASE * (2 ** (attempt - 1)) ))
+        if [[ "$sleep_s" -gt "$REGISTER_BACKOFF_MAX" ]]; then sleep_s="$REGISTER_BACKOFF_MAX"; fi
+
+        echo "Cloudflare rate limited (429) while registering warp${i}. Waiting ${sleep_s}s then retrying..." >&2
+        sleep "$sleep_s"
+        attempt=$((attempt + 1))
+        continue
+      fi
+
+      echo "$out" >&2
+      exit 43
+    done
+
+    out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
     cp wgcf-profile.conf "$conf"
-  )
+  ); then
+    rc=$?
+    if [[ "$rc" -eq 42 ]]; then
+      die "Cloudflare rate limit (429) while creating WARP #$i. Wait 15-60 minutes and re-run: warp-multi install (it will resume), or increase --register-delay / --register-retries."
+    fi
+    die "Failed to generate WARP config #$i (exit $rc)."
+  fi
 
   # Avoid letting wg-quick manage DNS in host; we'll set netns resolv.conf instead.
   sed -i '/^DNS =/d' "$conf" || true
@@ -235,6 +294,10 @@ cmd_install() {
   WG_PREFIX="$WG_PREFIX_DEFAULT"
   WGCF_VERSION="$WGCF_VERSION_DEFAULT"
   GOST_VERSION="$GOST_VERSION_DEFAULT"
+  REGISTER_DELAY="$REGISTER_DELAY_DEFAULT"
+  REGISTER_RETRIES="$REGISTER_RETRIES_DEFAULT"
+  REGISTER_BACKOFF_BASE="$REGISTER_BACKOFF_BASE_DEFAULT"
+  REGISTER_BACKOFF_MAX="$REGISTER_BACKOFF_MAX_DEFAULT"
   UPLINK_IF=""
 
   local old_count=""
@@ -254,6 +317,10 @@ cmd_install() {
       --uplink-if) UPLINK_IF="${2:?}"; shift 2 ;;
       --wgcf-version) WGCF_VERSION="${2:?}"; shift 2 ;;
       --gost-version) GOST_VERSION="${2:?}"; shift 2 ;;
+      --register-delay) REGISTER_DELAY="${2:?}"; shift 2 ;;
+      --register-retries) REGISTER_RETRIES="${2:?}"; shift 2 ;;
+      --register-backoff-base) REGISTER_BACKOFF_BASE="${2:?}"; shift 2 ;;
+      --register-backoff-max) REGISTER_BACKOFF_MAX="${2:?}"; shift 2 ;;
       -h|--help) usage_install; exit 0 ;;
       *) die "Unknown flag: $1" ;;
     esac
@@ -265,6 +332,14 @@ cmd_install() {
 
   [[ "$BASE_PORT" =~ ^[0-9]+$ ]] || die "--base-port must be a number"
   [[ "$BASE_PORT" -ge 1024 ]] || warn "--base-port < 1024 needs extra care; continuing anyway."
+
+  [[ "$REGISTER_DELAY" =~ ^[0-9]+$ ]] || die "--register-delay must be a number (seconds)"
+  [[ "$REGISTER_RETRIES" =~ ^[0-9]+$ ]] || die "--register-retries must be a number"
+  [[ "$REGISTER_RETRIES" -ge 1 ]] || die "--register-retries must be >= 1"
+  [[ "$REGISTER_BACKOFF_BASE" =~ ^[0-9]+$ ]] || die "--register-backoff-base must be a number (seconds)"
+  [[ "$REGISTER_BACKOFF_BASE" -ge 1 ]] || die "--register-backoff-base must be >= 1"
+  [[ "$REGISTER_BACKOFF_MAX" =~ ^[0-9]+$ ]] || die "--register-backoff-max must be a number (seconds)"
+  [[ "$REGISTER_BACKOFF_MAX" -ge 1 ]] || die "--register-backoff-max must be >= 1"
 
   if [[ -z "${UPLINK_IF:-}" ]]; then
     UPLINK_IF="$(detect_uplink)"
@@ -283,9 +358,16 @@ cmd_install() {
   save_config
 
   mkdir -p "$STATE_DIR" "$WG_DIR"
-  local i
+  local i conf
   for i in $(seq 1 "$COUNT"); do
+    conf="$(cfg_path "$i")"
+    if [[ -f "$conf" ]]; then
+      continue
+    fi
     gen_warp_conf "$i"
+    if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
+      sleep "$REGISTER_DELAY"
+    fi
   done
 
   write_systemd_units
@@ -520,11 +602,16 @@ Options:
   --wg-prefix STR    WireGuard config prefix (default: ${WG_PREFIX_DEFAULT})
   --wgcf-version V   wgcf version (default: ${WGCF_VERSION_DEFAULT})
   --gost-version V   gost version (default: ${GOST_VERSION_DEFAULT})
+  --register-delay S         Seconds to wait between registrations (default: ${REGISTER_DELAY_DEFAULT})
+  --register-retries N       Retries when Cloudflare returns 429 (default: ${REGISTER_RETRIES_DEFAULT})
+  --register-backoff-base S  Exponential backoff base seconds (default: ${REGISTER_BACKOFF_BASE_DEFAULT})
+  --register-backoff-max S   Max backoff seconds (default: ${REGISTER_BACKOFF_MAX_DEFAULT})
 
 Examples:
   warp-multi install
   warp-multi install --count 10 --base-port 40000 --base-net 10.250
   warp-multi install --uplink-if eth0
+  warp-multi install --count 10 --register-delay 12
 EOFU
 }
 

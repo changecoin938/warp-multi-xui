@@ -53,6 +53,13 @@ sudo -i
 /usr/local/bin/warp-multi install --count 10 --base-port 40000 --base-net 10.250
 ```
 
+اگر خطای `429 Too Many Requests` گرفتی (rate limit کلادفلر)، نصب را با delay بیشتر انجام بده:
+
+```bash
+sudo -i
+warp-multi install --count 10 --register-delay 12 --register-retries 10
+```
+
 اگر auto-detect اینترفیس مشکل داشت:
 
 ```bash
@@ -204,6 +211,22 @@ warp-multi restart 3
 
 ```bash
 systemctl status warp-netns@1 warp-socks@1 --no-pager
+```
+
+- **ارور `429 Too Many Requests` در wgcf**:
+  - این یعنی Cloudflare روی IP سرور شما برای Register کردن اکانت‌های WARP **rate limit** گذاشته.
+  - **راه‌حل**: ۱۵ تا ۶۰ دقیقه صبر کن و دوباره همین دستور رو بزن؛ اسکریپت از جایی که مونده ادامه می‌ده:
+
+```bash
+sudo -i
+warp-multi install --count 10
+```
+
+  - یا از اول با delay بیشتر اجرا کن:
+
+```bash
+sudo -i
+warp-multi install --count 10 --register-delay 12 --register-retries 10
 ```
 
 - **لاگ‌ها**:
