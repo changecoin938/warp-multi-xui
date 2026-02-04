@@ -1,0 +1,82 @@
+{
+  "outbounds": [
+    {
+      "tag": "warp01",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.1.2", "port": 40001 }] }
+    },
+    {
+      "tag": "warp02",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.2.2", "port": 40002 }] }
+    },
+    {
+      "tag": "warp03",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.3.2", "port": 40003 }] }
+    },
+    {
+      "tag": "warp04",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.4.2", "port": 40004 }] }
+    },
+    {
+      "tag": "warp05",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.5.2", "port": 40005 }] }
+    },
+    {
+      "tag": "warp06",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.6.2", "port": 40006 }] }
+    },
+    {
+      "tag": "warp07",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.7.2", "port": 40007 }] }
+    },
+    {
+      "tag": "warp08",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.8.2", "port": 40008 }] }
+    },
+    {
+      "tag": "warp09",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.9.2", "port": 40009 }] }
+    },
+    {
+      "tag": "warp10",
+      "protocol": "socks",
+      "settings": { "servers": [{ "address": "10.250.10.2", "port": 40010 }] }
+    }
+  ],
+  "routing": {
+    "balancers": [
+      {
+        "tag": "warp-balancer",
+        "selector": [
+          "warp01",
+          "warp02",
+          "warp03",
+          "warp04",
+          "warp05",
+          "warp06",
+          "warp07",
+          "warp08",
+          "warp09",
+          "warp10"
+        ],
+        "strategy": { "type": "random" }
+      }
+    ],
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": ["YOUR_INBOUND_TAG"],
+        "balancerTag": "warp-balancer"
+      }
+    ]
+  }
+}
+
