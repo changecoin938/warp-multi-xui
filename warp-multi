@@ -85,7 +85,30 @@ EOFCONF
 }
 
 detect_uplink() {
-  ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
+  local dev=""
+
+  # 1) IPv4 default route
+  dev="$(ip -4 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
+  if [[ -n "${dev:-}" ]]; then
+    echo "$dev"
+    return 0
+  fi
+
+  # 2) Route lookup to a well-known IPv4
+  dev="$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
+  if [[ -n "${dev:-}" ]]; then
+    echo "$dev"
+    return 0
+  fi
+
+  # 3) IPv6 default route (IPv6-only VPS)
+  dev="$(ip -6 route show default 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
+  if [[ -n "${dev:-}" ]]; then
+    echo "$dev"
+    return 0
+  fi
+
+  echo ""
 }
 
 arch_suffix() {
@@ -178,6 +201,11 @@ veth_ns() {
 socks_port() {
   local i="$1"
   echo $((BASE_PORT + i))
+}
+
+netns_exists() {
+  local ns="$1"
+  [[ -e "/run/netns/${ns}" || -e "/var/run/netns/${ns}" ]]
 }
 
 ipt() {
@@ -344,7 +372,8 @@ cmd_install() {
   if [[ -z "${UPLINK_IF:-}" ]]; then
     UPLINK_IF="$(detect_uplink)"
   fi
-  [[ -n "${UPLINK_IF:-}" ]] || die "Could not detect uplink interface; set with --uplink-if eth0"
+  [[ -n "${UPLINK_IF:-}" ]] || die "Could not detect uplink interface; set with --uplink-if <iface> (hint: ip -4 route show default)"
+  ip link show "$UPLINK_IF" >/dev/null 2>&1 || die "Uplink interface '$UPLINK_IF' not found. Pick the interface from: ip -4 route show default"
 
   if ! has_cmd apt-get; then
     die "Installer supports Ubuntu/Debian (apt) only."
@@ -357,22 +386,18 @@ cmd_install() {
 
   save_config
 
+  write_systemd_units
+
   mkdir -p "$STATE_DIR" "$WG_DIR"
   local i conf
   for i in $(seq 1 "$COUNT"); do
     conf="$(cfg_path "$i")"
-    if [[ -f "$conf" ]]; then
-      continue
+    if [[ ! -f "$conf" ]]; then
+      gen_warp_conf "$i"
+      if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
+        sleep "$REGISTER_DELAY"
+      fi
     fi
-    gen_warp_conf "$i"
-    if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
-      sleep "$REGISTER_DELAY"
-    fi
-  done
-
-  write_systemd_units
-
-  for i in $(seq 1 "$COUNT"); do
     systemctl enable --now "warp-netns@${i}.service" "warp-socks@${i}.service"
   done
 
@@ -480,7 +505,10 @@ cmd_proxies() {
 
 get_exit_ip() {
   local ns="$1"
-  ip netns exec "$ns" curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace \
+  if ! netns_exists "$ns"; then
+    return 20
+  fi
+  ip netns exec "$ns" curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
     | awk -F= '/^ip=/{print $2; exit}'
 }
 
@@ -489,7 +517,17 @@ cmd_ip() {
   local i="${1:?}"
   local ns
   ns="$(ns_name "$i")"
-  get_exit_ip "$ns" || echo "N/A"
+  local ip rc
+  if ip="$(get_exit_ip "$ns")"; then
+    echo "$ip"
+    return 0
+  fi
+  rc=$?
+  if [[ "$rc" -eq 20 ]]; then
+    echo "MISSING_NETNS"
+  else
+    echo "N/A"
+  fi
 }
 
 cmd_ips() {
@@ -498,8 +536,39 @@ cmd_ips() {
   for i in $(seq 1 "$COUNT"); do
     ns="$(ns_name "$i")"
     printf "warp%02d: " "$i"
-    ip="$(get_exit_ip "$ns" || true)"
-    echo "${ip:-N/A}"
+    if ip="$(get_exit_ip "$ns")"; then
+      echo "$ip"
+    else
+      if [[ "$?" -eq 20 ]]; then
+        echo "MISSING_NETNS"
+      else
+        echo "N/A"
+      fi
+    fi
+  done
+}
+
+cmd_up() {
+  require_root
+  load_config
+
+  if [[ ! -f "$UNIT_NETNS" || ! -f "$UNIT_SOCKS" ]]; then
+    write_systemd_units
+  fi
+
+  local i
+  for i in $(seq 1 "$COUNT"); do
+    systemctl enable --now "warp-netns@${i}.service" "warp-socks@${i}.service"
+  done
+}
+
+cmd_down() {
+  require_root
+  load_config
+
+  local i
+  for i in $(seq 1 "$COUNT"); do
+    systemctl stop "warp-socks@${i}.service" "warp-netns@${i}.service" 2>/dev/null || true
   done
 }
 
@@ -610,7 +679,7 @@ Options:
 Examples:
   warp-multi install
   warp-multi install --count 10 --base-port 40000 --base-net 10.250
-  warp-multi install --uplink-if eth0
+  warp-multi install --uplink-if ens3
   warp-multi install --count 10 --register-delay 12
 EOFU
 }
@@ -621,6 +690,8 @@ warp-multi v${VERSION}
 
 Commands:
   install [flags]          Install deps, generate configs, enable services
+  up                       Start/enable all services (does not re-register)
+  down                     Stop all services (keeps configs)
   proxies                  Print SOCKS5 endpoints (for x-ui/xray outbounds)
   ip <i>                   Show exit IP for one tunnel
   ips                      Show exit IPs for all tunnels
@@ -647,6 +718,8 @@ main() {
   shift || true
   case "$cmd" in
     install) cmd_install "$@" ;;
+    up) cmd_up "$@" ;;
+    down) cmd_down "$@" ;;
     proxies) cmd_proxies "$@" ;;
     ip) cmd_ip "$@" ;;
     ips) cmd_ips "$@" ;;

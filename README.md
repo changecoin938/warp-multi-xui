@@ -60,11 +60,19 @@ sudo -i
 warp-multi install --count 10 --register-delay 12 --register-retries 10
 ```
 
-اگر auto-detect اینترفیس مشکل داشت:
+اگر auto-detect اینترفیس مشکل داشت (اسم اینترفیس ممکنه `eth0` نباشه مثل `ens3`/`enp1s0`):
+
+اینترفیس درست رو ببین:
+
+```bash
+ip -4 route show default
+```
+
+بعد همون رو بده به اسکریپت:
 
 ```bash
 sudo -i
-warp-multi install --uplink-if eth0
+warp-multi install --uplink-if ens3
 ```
 
 ---
@@ -144,6 +152,18 @@ warp-multi --help
 
 ```bash
 warp-multi install --count 10
+```
+
+- **بالا آوردن سرویس‌ها (بدون ساخت اکانت جدید)**:
+
+```bash
+warp-multi up
+```
+
+- **خاموش کردن سرویس‌ها (کانفیگ‌ها پاک نمی‌شوند)**:
+
+```bash
+warp-multi down
 ```
 
 - **نمایش وضعیت سرویس‌ها + IP خروجی**:
@@ -227,6 +247,22 @@ warp-multi install --count 10
 ```bash
 sudo -i
 warp-multi install --count 10 --register-delay 12 --register-retries 10
+```
+
+- **اگر `warp-multi ips` گفت `MISSING_NETNS`**:
+  - یعنی سرویس‌ها بالا نیستن/نصب کامل نشده.
+  - اول اینو بزن:
+
+```bash
+sudo -i
+warp-multi up
+```
+
+  - اگر سرویس‌ها وجود ندارن یا باز هم حل نشد:
+
+```bash
+sudo -i
+warp-multi install --count 10
 ```
 
 - **لاگ‌ها**:
