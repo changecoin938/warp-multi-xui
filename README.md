@@ -21,27 +21,33 @@
 
 ### نصب سریع (پیشنهادی)
 
-این دستور `warp-multi` را نصب می‌کند و **به‌صورت پیش‌فرض ۱۰ خروجی** می‌سازد:
+این دستور `warp-multi` را نصب می‌کند و **به‌صورت پیش‌فرض ۱۰ خروجی** می‌سازد.
+
+**اگر سرور شما root-only است (sudo نداری / از قبل root هستی):**
 
 ```bash
-sudo -i
 bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) --count 10
+```
+
+**اگر sudo داری و می‌خوای یک‌خطی اجرا کنی:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh | sudo bash -s -- --count 10
 ```
 
 اگر ریپو را fork کردی:
 
 ```bash
-sudo -i
 REPO="YOUR_USER/warp-multi-xui" bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/warp-multi-xui/main/install.sh) --count 10
 ```
 
 یا نصب از طریق clone:
 
 ```bash
-sudo apt update && sudo apt install -y git
+apt update && apt install -y git
 git clone https://github.com/changecoin938/warp-multi-xui.git
 cd warp-multi-xui
-sudo bash install.sh --count 10
+bash install.sh --count 10
 ```
 
 ### تنظیمات قابل تغییر در نصب
@@ -49,14 +55,12 @@ sudo bash install.sh --count 10
 نمونه‌ها:
 
 ```bash
-sudo -i
 /usr/local/bin/warp-multi install --count 10 --base-port 40000 --base-net 10.250
 ```
 
 اگر خطای `429 Too Many Requests` گرفتی (rate limit کلادفلر)، نصب را با delay بیشتر انجام بده:
 
 ```bash
-sudo -i
 warp-multi install --count 10 --register-delay 12 --register-retries 10
 ```
 
@@ -71,7 +75,6 @@ ip -4 route show default
 بعد همون رو بده به اسکریپت:
 
 ```bash
-sudo -i
 warp-multi install --uplink-if ens3
 ```
 
@@ -238,14 +241,12 @@ systemctl status warp-netns@1 warp-socks@1 --no-pager
   - **راه‌حل**: ۱۵ تا ۶۰ دقیقه صبر کن و دوباره همین دستور رو بزن؛ اسکریپت از جایی که مونده ادامه می‌ده:
 
 ```bash
-sudo -i
 warp-multi install --count 10
 ```
 
   - یا از اول با delay بیشتر اجرا کن:
 
 ```bash
-sudo -i
 warp-multi install --count 10 --register-delay 12 --register-retries 10
 ```
 
@@ -254,14 +255,12 @@ warp-multi install --count 10 --register-delay 12 --register-retries 10
   - اول اینو بزن:
 
 ```bash
-sudo -i
 warp-multi up
 ```
 
   - اگر سرویس‌ها وجود ندارن یا باز هم حل نشد:
 
 ```bash
-sudo -i
 warp-multi install --count 10
 ```
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (sudo -i)"; }
+require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (login as root, or use sudo if it exists)."; }
 
 require_root
 

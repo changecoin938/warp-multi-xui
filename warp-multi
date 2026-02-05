@@ -37,7 +37,9 @@ log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (sudo -i)"; }
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root (login as root, or use sudo if it exists)."
+}
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
