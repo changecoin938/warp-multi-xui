@@ -233,8 +233,8 @@ warp-multi restart 3
 systemctl status warp-netns@1 warp-socks@1 --no-pager
 ```
 
-- **ارور `429 Too Many Requests` در wgcf**:
-  - این یعنی Cloudflare روی IP سرور شما برای Register کردن اکانت‌های WARP **rate limit** گذاشته.
+- **ارور `429 Too Many Requests` یا `401 Unauthorized` در wgcf**:
+  - این یعنی Cloudflare روی IP سرور شما برای Register کردن اکانت‌های WARP **rate limit / block موقت** گذاشته.
   - **راه‌حل**: ۱۵ تا ۶۰ دقیقه صبر کن و دوباره همین دستور رو بزن؛ اسکریپت از جایی که مونده ادامه می‌ده:
 
 ```bash

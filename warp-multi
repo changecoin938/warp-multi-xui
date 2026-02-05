@@ -225,7 +225,7 @@ gen_warp_conf() {
   fi
 
   log "Generating WARP config #$i ..."
-  if ! (
+  (
     set -euo pipefail
     cd "$dir"
     umask 077
@@ -235,7 +235,7 @@ gen_warp_conf() {
     while true; do
       out="$(wgcf register --accept-tos 2>&1)" && break
 
-      if echo "$out" | grep -q '429 Too Many Requests'; then
+      if echo "$out" | grep -qE '429 Too Many Requests|401 Unauthorized|403 Forbidden'; then
         if [[ "$attempt" -ge "$REGISTER_RETRIES" ]]; then
           echo "$out" >&2
           exit 42
@@ -244,7 +244,7 @@ gen_warp_conf() {
         sleep_s=$(( REGISTER_BACKOFF_BASE * (2 ** (attempt - 1)) ))
         if [[ "$sleep_s" -gt "$REGISTER_BACKOFF_MAX" ]]; then sleep_s="$REGISTER_BACKOFF_MAX"; fi
 
-        echo "Cloudflare rate limited (429) while registering warp${i}. Waiting ${sleep_s}s then retrying..." >&2
+        echo "Cloudflare rejected registration (429/401/403) while registering warp${i}. Waiting ${sleep_s}s then retrying..." >&2
         sleep "$sleep_s"
         attempt=$((attempt + 1))
         continue
@@ -256,10 +256,11 @@ gen_warp_conf() {
 
     out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
     cp wgcf-profile.conf "$conf"
-  ); then
-    rc=$?
+  )
+  rc=$?
+  if [[ "$rc" -ne 0 ]]; then
     if [[ "$rc" -eq 42 ]]; then
-      die "Cloudflare rate limit (429) while creating WARP #$i. Wait 15-60 minutes and re-run: warp-multi install (it will resume), or increase --register-delay / --register-retries."
+      die "Cloudflare rejected registration (429/401/403) while creating WARP #$i. Wait 15-60 minutes and re-run: warp-multi install (it will resume), or increase --register-delay / --register-retries / --register-backoff-base."
     fi
     die "Failed to generate WARP config #$i (exit $rc)."
   fi
