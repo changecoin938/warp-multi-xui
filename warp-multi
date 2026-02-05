@@ -715,6 +715,9 @@ EOFU
 }
 
 main() {
+  # Ensure defaults are set even when user runs `warp-multi --help` (no config loaded).
+  ensure_defaults
+
   local cmd="${1:-}"
   shift || true
   case "$cmd" in
