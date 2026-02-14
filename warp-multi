@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -1224,11 +1224,22 @@ cmd_renew() {
   fi
   [[ -f "$conf" ]] || die "Missing config: $conf (run: warp-multi install)"
 
-  (
+  local tmp old_conf old_state state_dir
+  tmp="$(mktemp -d)"
+  old_conf="${tmp}/old.conf"
+  old_state="${tmp}/old_state"
+  state_dir="$(state_path "$i")"
+
+  cp -f "$conf" "$old_conf" 2>/dev/null || true
+  if [[ -d "$state_dir" ]]; then
+    cp -a "$state_dir" "$old_state" 2>/dev/null || true
+  fi
+
+  if (
     set -euo pipefail
     ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
     rm -f "$conf" 2>/dev/null || true
-    rm -rf "$(state_path "$i")" 2>/dev/null || true
+    rm -rf "$state_dir" 2>/dev/null || true
 
     gen_warp_conf "$i"
     conf="$(cfg_path "$i")"
@@ -1236,9 +1247,29 @@ cmd_renew() {
 
     ip netns exec "$ns" wg-quick up "$conf" >/dev/null
     warp_try_fix_handshake "$i" "$ns" "$conf"
-  )
+  ); then
+    rm -rf "$tmp" 2>/dev/null || true
+    log "New exit IP for warp$(printf '%02d' "$i"): $(cmd_ip "$i")"
+    return 0
+  fi
 
-  log "New exit IP for warp$(printf '%02d' "$i"): $(cmd_ip "$i")"
+  warn "warp$(printf '%02d' "$i") renew failed; restoring previous config."
+  if [[ -f "$old_conf" ]]; then
+    cp -f "$old_conf" "$conf" 2>/dev/null || true
+    normalize_warp_conf "$i" "$conf" || true
+  fi
+  if [[ -d "$old_state" ]]; then
+    rm -rf "$state_dir" 2>/dev/null || true
+    cp -a "$old_state" "$state_dir" 2>/dev/null || true
+  fi
+
+  # Best-effort: bring the old tunnel back up.
+  ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
+  ip netns exec "$ns" wg-quick up "$conf" >/dev/null 2>&1 || true
+  warp_try_fix_handshake "$i" "$ns" "$conf" 2>/dev/null || true
+
+  rm -rf "$tmp" 2>/dev/null || true
+  die "warp$(printf '%02d' "$i") renew failed (restored previous config)."
 }
 
 cmd_renew_all() {
