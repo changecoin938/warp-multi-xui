@@ -10,7 +10,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.2.5"
+VERSION="0.2.6"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -43,6 +43,12 @@ EXIT_IP_RETRIES_DEFAULT=3
 EXIT_IP_DELAY_DEFAULT=1
 EXIT_IP_MAX_TIME_DEFAULT=6
 EXIT_IP_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
+
+# WARP WireGuard reachability helpers
+WARP_ENDPOINT_HOST_DEFAULT="engage.cloudflareclient.com"
+WARP_ENDPOINT_PORTS_DEFAULT="2408,500,1701,4500"
+WARP_HANDSHAKE_WAIT_DEFAULT=12   # seconds to wait for initial handshake
+WARP_HANDSHAKE_TRY_WAIT_DEFAULT=6 # seconds to wait after changing endpoint/port
 
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
@@ -168,6 +174,11 @@ ensure_defaults() {
   REGISTER_RETRIES="${REGISTER_RETRIES:-$REGISTER_RETRIES_DEFAULT}"
   REGISTER_BACKOFF_BASE="${REGISTER_BACKOFF_BASE:-$REGISTER_BACKOFF_BASE_DEFAULT}"
   REGISTER_BACKOFF_MAX="${REGISTER_BACKOFF_MAX:-$REGISTER_BACKOFF_MAX_DEFAULT}"
+
+  WARP_ENDPOINT_HOST="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+  WARP_HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
+  WARP_HANDSHAKE_TRY_WAIT="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
 }
 
 load_config() {
@@ -195,6 +206,10 @@ REGISTER_DELAY=${REGISTER_DELAY}
 REGISTER_RETRIES=${REGISTER_RETRIES}
 REGISTER_BACKOFF_BASE=${REGISTER_BACKOFF_BASE}
 REGISTER_BACKOFF_MAX=${REGISTER_BACKOFF_MAX}
+WARP_ENDPOINT_HOST=${WARP_ENDPOINT_HOST}
+WARP_ENDPOINT_PORTS=${WARP_ENDPOINT_PORTS}
+WARP_HANDSHAKE_WAIT=${WARP_HANDSHAKE_WAIT}
+WARP_HANDSHAKE_TRY_WAIT=${WARP_HANDSHAKE_TRY_WAIT}
 EOFCONF
 }
 
@@ -462,7 +477,7 @@ ensure_wgconf_endpoint_ipv4() {
 
   # Resolve IPv4 for the current hostname (or the default WARP hostname).
   if [[ -z "$host" ]]; then
-    host="engage.cloudflareclient.com"
+    host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
   fi
 
   raw="$(pick_endpoint_ipv4_for_index "$i" "$host" || true)"
@@ -472,6 +487,145 @@ ensure_wgconf_endpoint_ipv4() {
   fi
 
   sed -i -E "s|^Endpoint[[:space:]]*=.*|Endpoint = ${raw}:${port}|" "$conf" || true
+}
+
+wgconf_peer_pubkey() {
+  local conf="${1:?}"
+  awk -F= '
+    BEGIN { in_peer=0 }
+    /^\[Peer\]$/ { in_peer=1; next }
+    /^\[.*\]$/   { in_peer=0 }
+    in_peer && /^PublicKey[[:space:]]*=/ {
+      val=$0
+      sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", val)
+      gsub(/[[:space:]]/, "", val)
+      print val
+      exit
+    }
+  ' "$conf" 2>/dev/null || true
+}
+
+wg_latest_handshake_ts() {
+  local ns="${1:?}"
+  local iface="${2:?}"
+  local out ts
+  out="$(ip netns exec "$ns" wg show "$iface" latest-handshakes 2>/dev/null || true)"
+  ts="$(awk '{print $2; exit}' <<<"$out" 2>/dev/null || true)"
+  [[ -n "${ts:-}" ]] || { echo 0; return 1; }
+  echo "$ts"
+  return 0
+}
+
+wg_wait_handshake() {
+  local ns="${1:?}"
+  local iface="${2:?}"
+  local timeout_s="${3:-10}"
+
+  [[ "$timeout_s" =~ ^[0-9]+$ ]] || timeout_s=10
+  local end now ts
+  end=$(( $(date +%s) + timeout_s ))
+
+  while true; do
+    ts="$(wg_latest_handshake_ts "$ns" "$iface" 2>/dev/null || echo 0)"
+    if [[ "${ts:-0}" -gt 0 ]]; then
+      return 0
+    fi
+    now="$(date +%s)"
+    [[ "$now" -lt "$end" ]] || break
+    sleep 1
+  done
+  return 1
+}
+
+set_wgconf_endpoint() {
+  local conf="${1:?}"
+  local ip="${2:?}"
+  local port="${3:?}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
+  if grep -q '^Endpoint[[:space:]]*=' "$conf" 2>/dev/null; then
+    sed -i -E "s|^Endpoint[[:space:]]*=.*|Endpoint = ${ip}:${port}|" "$conf" || true
+    return 0
+  fi
+
+  # Insert under [Peer] if Endpoint line is missing.
+  sed -i "/^\\[Peer\\]$/a Endpoint = ${ip}:${port}" "$conf" || true
+  return 0
+}
+
+warp_try_fix_handshake() {
+  local i="${1:?}"
+  local ns="${2:?}"
+  local conf="${3:?}"
+
+  local iface peer cur_ep cur_host cur_port
+  iface="${WG_PREFIX}${i}"
+  peer="$(wgconf_peer_pubkey "$conf")"
+  [[ -n "${peer:-}" ]] || return 1
+
+  # First, wait a bit for initial handshake (especially right after boot).
+  # Trigger traffic so wg initiates handshake immediately (otherwise it may wait for keepalive).
+  ip netns exec "$ns" curl -4 -fsS --max-time 2 "${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}" >/dev/null 2>&1 || true
+  if wg_wait_handshake "$ns" "$iface" "${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"; then
+    return 0
+  fi
+
+  cur_ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
+  cur_host="${cur_ep%:*}"
+  cur_port="${cur_ep##*:}"
+  [[ "$cur_port" =~ ^[0-9]+$ ]] || cur_port="2408"
+
+  local host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+
+  local -a ips=()
+  local ip preferred
+  if is_ipv4 "$cur_host"; then
+    ips+=("$cur_host")
+  fi
+  preferred="$(pick_endpoint_ipv4_for_index "$i" "$host" 2>/dev/null || true)"
+  [[ -n "${preferred:-}" ]] && ips+=("$preferred")
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    ips+=("$ip")
+  done < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
+
+  # Dedupe IPs
+  if [[ "${#ips[@]}" -gt 0 ]]; then
+    mapfile -t ips < <(printf '%s\n' "${ips[@]}" | awk 'NF && !seen[$0]++')
+  fi
+
+  local ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+  ports_csv="${ports_csv//[[:space:]]/}"
+  local -a ports=()
+  local -a ports_raw=()
+  local p
+  IFS=',' read -r -a ports_raw <<<"$ports_csv"
+  ports_raw+=("$cur_port")
+  mapfile -t ports < <(printf '%s\n' "${ports_raw[@]}" \
+    | awk 'NF && $0 ~ /^[0-9]+$/ && $0 >= 1 && $0 <= 65535 && !seen[$0]++')
+
+  [[ "${#ips[@]}" -gt 0 ]] || return 1
+  [[ "${#ports[@]}" -gt 0 ]] || return 1
+
+  local try_wait="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
+  [[ "$try_wait" =~ ^[0-9]+$ ]] || try_wait="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
+
+  for p in "${ports[@]}"; do
+    for ip in "${ips[@]}"; do
+      [[ -n "$ip" ]] || continue
+      set_wgconf_endpoint "$conf" "$ip" "$p" || true
+      ip netns exec "$ns" wg set "$iface" peer "$peer" endpoint "${ip}:${p}" 2>/dev/null || true
+      # Trigger traffic so wg tries immediately.
+      ip netns exec "$ns" curl -4 -fsS --max-time 2 "${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}" >/dev/null 2>&1 || true
+      if wg_wait_handshake "$ns" "$iface" "$try_wait"; then
+        log "warp$(printf '%02d' "$i") handshake OK via Endpoint=${ip}:${p}"
+        return 0
+      fi
+    done
+  done
+
+  warn "warp$(printf '%02d' "$i") has no handshake after trying endpoints/ports (host=${host}, ports=${ports_csv})."
+  return 1
 }
 
 reg_base_net() {
@@ -725,6 +879,10 @@ cmd_install() {
   REGISTER_RETRIES="$REGISTER_RETRIES_DEFAULT"
   REGISTER_BACKOFF_BASE="$REGISTER_BACKOFF_BASE_DEFAULT"
   REGISTER_BACKOFF_MAX="$REGISTER_BACKOFF_MAX_DEFAULT"
+  WARP_ENDPOINT_HOST="$WARP_ENDPOINT_HOST_DEFAULT"
+  WARP_ENDPOINT_PORTS="$WARP_ENDPOINT_PORTS_DEFAULT"
+  WARP_HANDSHAKE_WAIT="$WARP_HANDSHAKE_WAIT_DEFAULT"
+  WARP_HANDSHAKE_TRY_WAIT="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
   UPLINK_IF=""
 
   local old_count=""
@@ -981,6 +1139,9 @@ EOFRES
       cmd_ns_down "$i" >/dev/null 2>&1 || true
       die "Failed to bring up WireGuard for $ns ($conf)."
     fi
+
+    # Best-effort: some networks block UDP/2408; try alternative ports/endpoints if no handshake.
+    warp_try_fix_handshake "$i" "$ns" "$conf" || true
   fi
 }
 
