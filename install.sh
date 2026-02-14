@@ -22,10 +22,19 @@ else
   chmod +x /usr/local/bin/warp-multi
 fi
 
-if [[ "${1:-}" == "--no-run" ]]; then
+no_run=0
+args=()
+for a in "$@"; do
+  if [[ "$a" == "--no-run" ]]; then
+    no_run=1
+  else
+    args+=("$a")
+  fi
+done
+
+if [[ "$no_run" -eq 1 ]]; then
   echo "Installed /usr/local/bin/warp-multi (not running install)."
   exit 0
 fi
 
-exec /usr/local/bin/warp-multi install "$@"
-
+exec /usr/local/bin/warp-multi install "${args[@]}"
