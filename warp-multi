@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -127,7 +127,7 @@ apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y --no-install-recommends \
-    ca-certificates curl jq iproute2 iptables wireguard-tools
+    ca-certificates curl gzip jq iproute2 iptables wireguard-tools
 }
 
 install_wgcf() {
@@ -214,6 +214,18 @@ ipt() {
   iptables -w 5 "$@"
 }
 
+ipt_ensure_top() {
+  local table="${1:?}"
+  local chain="${2:?}"
+  shift 2
+
+  # Remove duplicates then insert at the top to win over generic firewall rules.
+  while ipt -t "$table" -C "$chain" "$@" 2>/dev/null; do
+    ipt -t "$table" -D "$chain" "$@" 2>/dev/null || break
+  done
+  ipt -t "$table" -I "$chain" 1 "$@"
+}
+
 gen_warp_conf() {
   local i="$1"
   local dir conf
@@ -227,7 +239,8 @@ gen_warp_conf() {
   fi
 
   log "Generating WARP config #$i ..."
-  (
+  local rc=0
+  if (
     set -euo pipefail
     cd "$dir"
     umask 077
@@ -258,9 +271,10 @@ gen_warp_conf() {
 
     out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
     cp wgcf-profile.conf "$conf"
-  )
-  rc=$?
-  if [[ "$rc" -ne 0 ]]; then
+  ); then
+    :
+  else
+    rc=$?
     if [[ "$rc" -eq 42 ]]; then
       die "Cloudflare rejected registration (429/401/403) while creating WARP #$i. Wait 15-60 minutes and re-run: warp-multi install (it will resume), or increase --register-delay / --register-retries / --register-backoff-base."
     fi
@@ -452,14 +466,9 @@ nameserver 1.1.1.1
 nameserver 1.0.0.1
 EOFRES
 
-  ipt -t nat -C POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE 2>/dev/null || \
-    ipt -t nat -A POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
-
-  ipt -C FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || \
-    ipt -A FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
-
-  ipt -C FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    ipt -A FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT
+  ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+  ipt_ensure_top filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
+  ipt_ensure_top filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
   ip netns exec "$ns" wg-quick up "$conf" >/dev/null
 }
@@ -479,7 +488,7 @@ cmd_ns_down() {
 
   ipt -t nat -D POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE 2>/dev/null || true
   ipt -D FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || true
-  ipt -D FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ipt -D FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
   ip link del "$vh" 2>/dev/null || true
   ip netns del "$ns" 2>/dev/null || true
@@ -511,8 +520,20 @@ get_exit_ip() {
   if ! netns_exists "$ns"; then
     return 20
   fi
-  ip netns exec "$ns" curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
-    | awk -F= '/^ip=/{print $2; exit}'
+
+  # Prefer IPv6 (WARP usually provides it even on IPv4-only servers); fall back to IPv4.
+  local out ip
+  out="$(ip netns exec "$ns" curl -6 -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+  ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
+  if [[ -n "${ip:-}" ]]; then
+    echo "$ip"
+    return 0
+  fi
+
+  out="$(ip netns exec "$ns" curl -4 -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+  ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
+  [[ -n "${ip:-}" ]] || return 1
+  echo "$ip"
 }
 
 cmd_ip() {
@@ -618,6 +639,9 @@ cmd_rotate_all() {
   local i
   for i in $(seq 1 "$COUNT"); do
     cmd_rotate "$i"
+    if [[ "${REGISTER_DELAY:-0}" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
+      sleep "$REGISTER_DELAY"
+    fi
   done
 }
 
@@ -743,4 +767,3 @@ main() {
 }
 
 main "$@"
-
