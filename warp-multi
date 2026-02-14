@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -33,6 +33,18 @@ REGISTER_RETRIES_DEFAULT=8        # retries when 429 happens
 REGISTER_BACKOFF_BASE_DEFAULT=15  # exponential backoff base seconds (15,30,60,120,...)
 REGISTER_BACKOFF_MAX_DEFAULT=900  # max backoff seconds
 
+# exit IP probing
+EXIT_IP_RETRIES_DEFAULT=3
+EXIT_IP_DELAY_DEFAULT=1
+EXIT_IP_MAX_TIME_DEFAULT=4
+EXIT_IP_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
+
+# WireGuard/WARP reachability helpers
+WARP_ENDPOINT_HOST_DEFAULT="engage.cloudflareclient.com"
+WARP_ENDPOINT_PORTS_DEFAULT="2408,500,1701,4500"
+WARP_HANDSHAKE_WAIT_DEFAULT=12
+WARP_HANDSHAKE_TRY_WAIT_DEFAULT=6
+
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -42,6 +54,34 @@ require_root() {
 }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+is_ipv4() {
+  local ip="${1:-}"
+  [[ "$ip" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]] || return 1
+
+  local o1 o2 o3 o4
+  IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
+  for o in "$o1" "$o2" "$o3" "$o4"; do
+    [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+  done
+  return 0
+}
+
+resolve_endpoint_ipv4s() {
+  local host="${1:?}"
+  has_cmd getent || return 1
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | awk 'NF && !seen[$0]++'
+}
+
+pick_endpoint_ipv4_for_index() {
+  local i="${1:?}"
+  local host="${2:?}"
+  local -a ips=()
+  mapfile -t ips < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
+  [[ "${#ips[@]}" -gt 0 ]] || return 1
+  local idx=$(( (i - 1) % ${#ips[@]} ))
+  echo "${ips[$idx]}"
+}
 
 ensure_defaults() {
   COUNT="${COUNT:-$COUNT_DEFAULT}"
@@ -58,6 +98,16 @@ ensure_defaults() {
   REGISTER_RETRIES="${REGISTER_RETRIES:-$REGISTER_RETRIES_DEFAULT}"
   REGISTER_BACKOFF_BASE="${REGISTER_BACKOFF_BASE:-$REGISTER_BACKOFF_BASE_DEFAULT}"
   REGISTER_BACKOFF_MAX="${REGISTER_BACKOFF_MAX:-$REGISTER_BACKOFF_MAX_DEFAULT}"
+
+  EXIT_IP_RETRIES="${EXIT_IP_RETRIES:-$EXIT_IP_RETRIES_DEFAULT}"
+  EXIT_IP_DELAY="${EXIT_IP_DELAY:-$EXIT_IP_DELAY_DEFAULT}"
+  EXIT_IP_MAX_TIME="${EXIT_IP_MAX_TIME:-$EXIT_IP_MAX_TIME_DEFAULT}"
+  EXIT_IP_URL="${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}"
+
+  WARP_ENDPOINT_HOST="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+  WARP_HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
+  WARP_HANDSHAKE_TRY_WAIT="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
 }
 
 load_config() {
@@ -83,6 +133,14 @@ REGISTER_DELAY=${REGISTER_DELAY}
 REGISTER_RETRIES=${REGISTER_RETRIES}
 REGISTER_BACKOFF_BASE=${REGISTER_BACKOFF_BASE}
 REGISTER_BACKOFF_MAX=${REGISTER_BACKOFF_MAX}
+EXIT_IP_RETRIES=${EXIT_IP_RETRIES}
+EXIT_IP_DELAY=${EXIT_IP_DELAY}
+EXIT_IP_MAX_TIME=${EXIT_IP_MAX_TIME}
+EXIT_IP_URL=${EXIT_IP_URL}
+WARP_ENDPOINT_HOST=${WARP_ENDPOINT_HOST}
+WARP_ENDPOINT_PORTS=${WARP_ENDPOINT_PORTS}
+WARP_HANDSHAKE_WAIT=${WARP_HANDSHAKE_WAIT}
+WARP_HANDSHAKE_TRY_WAIT=${WARP_HANDSHAKE_TRY_WAIT}
 EOFCONF
 }
 
@@ -210,6 +268,50 @@ netns_exists() {
   [[ -e "/run/netns/${ns}" || -e "/var/run/netns/${ns}" ]]
 }
 
+netns_curl() {
+  local ns="${1:?}"
+  shift || true
+  if [[ "${WARP_MULTI_DEBUG:-0}" == "1" ]]; then
+    ip netns exec "$ns" curl "$@"
+  else
+    ip netns exec "$ns" curl "$@" 2>/dev/null
+  fi
+}
+
+write_netns_resolv_conf() {
+  local ns="${1:?}"
+  mkdir -p "/etc/netns/$ns"
+
+  local src=""
+  if [[ -f "/run/systemd/resolve/resolv.conf" ]]; then
+    src="/run/systemd/resolve/resolv.conf"
+  elif [[ -f "/etc/resolv.conf" ]]; then
+    src="/etc/resolv.conf"
+  fi
+
+  local -a servers=()
+  local s
+  if [[ -n "${src:-}" ]]; then
+    while IFS= read -r s; do
+      [[ -n "${s:-}" ]] || continue
+      is_ipv4 "$s" || continue
+      [[ "$s" != 127.* ]] || continue
+      servers+=("$s")
+    done < <(awk '/^nameserver[[:space:]]+/ {print $2}' "$src" 2>/dev/null || true)
+  fi
+
+  if [[ "${#servers[@]}" -eq 0 ]]; then
+    servers=("1.1.1.1" "1.0.0.1" "8.8.8.8")
+  fi
+
+  {
+    for s in "${servers[@]}"; do
+      echo "nameserver $s"
+    done
+    echo "options timeout:1 attempts:2"
+  } >"/etc/netns/$ns/resolv.conf"
+}
+
 ipt() {
   iptables -w 5 "$@"
 }
@@ -226,6 +328,82 @@ ipt_ensure_top() {
   ipt -t "$table" -I "$chain" 1 "$@"
 }
 
+ipt_delete_all() {
+  local table="${1:?}"
+  local chain="${2:?}"
+  shift 2
+
+  while ipt -t "$table" -C "$chain" "$@" 2>/dev/null; do
+    ipt -t "$table" -D "$chain" "$@" 2>/dev/null || break
+  done
+}
+
+wgconf_peer_pubkey() {
+  local conf="${1:?}"
+  awk -F= '/^PublicKey[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$conf" 2>/dev/null || true
+}
+
+set_wgconf_endpoint() {
+  local conf="${1:?}"
+  local ip="${2:?}"
+  local port="${3:?}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
+  if grep -q '^Endpoint[[:space:]]*=' "$conf" 2>/dev/null; then
+    sed -i -E "s|^Endpoint[[:space:]]*=.*|Endpoint = ${ip}:${port}|" "$conf" || true
+    return 0
+  fi
+
+  # Insert under [Peer] if Endpoint line is missing.
+  sed -i "/^\\[Peer\\]$/a Endpoint = ${ip}:${port}" "$conf" || true
+  return 0
+}
+
+pin_warp_endpoint() {
+  local i="${1:?}"
+  local conf="${2:?}"
+
+  local cur_ep cur_host cur_port host ip
+  cur_ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
+  cur_host="${cur_ep%:*}"
+  cur_port="${cur_ep##*:}"
+  [[ "$cur_port" =~ ^[0-9]+$ ]] || cur_port="2408"
+
+  # If it's already an IP, keep it.
+  if is_ipv4 "$cur_host"; then
+    return 0
+  fi
+
+  host="$cur_host"
+  if [[ -z "${host:-}" ]] || [[ "$host" == "$WARP_ENDPOINT_HOST_DEFAULT" ]]; then
+    host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  fi
+  [[ -n "${host:-}" ]] || return 0
+
+  ip="$(pick_endpoint_ipv4_for_index "$i" "$host" 2>/dev/null || true)"
+  [[ -n "${ip:-}" ]] || return 0
+
+  set_wgconf_endpoint "$conf" "$ip" "$cur_port" || true
+}
+
+normalize_warp_conf() {
+  local i="${1:?}"
+  local conf="${2:?}"
+
+  # Avoid letting wg-quick manage DNS in host; we set netns resolv.conf instead.
+  sed -i '/^DNS =/d' "$conf" 2>/dev/null || true
+
+  # Keepalive helps on some VPS providers.
+  if ! grep -q '^PersistentKeepalive' "$conf" 2>/dev/null; then
+    sed -i '/^\[Peer\]/a PersistentKeepalive = 25' "$conf" 2>/dev/null || true
+  fi
+
+  # Pin Endpoint hostname to a real IPv4 to avoid DNS issues inside netns and to spread tunnels across A records.
+  pin_warp_endpoint "$i" "$conf" || true
+
+  chmod 600 "$conf" 2>/dev/null || true
+}
+
 gen_warp_conf() {
   local i="$1"
   local dir conf
@@ -235,6 +413,7 @@ gen_warp_conf() {
   mkdir -p "$dir" "$WG_DIR"
 
   if [[ -f "$conf" ]]; then
+    normalize_warp_conf "$i" "$conf"
     return 0
   fi
 
@@ -281,15 +460,7 @@ gen_warp_conf() {
     die "Failed to generate WARP config #$i (exit $rc)."
   fi
 
-  # Avoid letting wg-quick manage DNS in host; we'll set netns resolv.conf instead.
-  sed -i '/^DNS =/d' "$conf" || true
-
-  # Keepalive helps on some VPS providers.
-  if ! grep -q '^PersistentKeepalive' "$conf"; then
-    sed -i '/^\[Peer\]/a PersistentKeepalive = 25' "$conf"
-  fi
-
-  chmod 600 "$conf"
+  normalize_warp_conf "$i" "$conf"
 }
 
 write_systemd_units() {
@@ -343,6 +514,14 @@ cmd_install() {
   REGISTER_RETRIES="$REGISTER_RETRIES_DEFAULT"
   REGISTER_BACKOFF_BASE="$REGISTER_BACKOFF_BASE_DEFAULT"
   REGISTER_BACKOFF_MAX="$REGISTER_BACKOFF_MAX_DEFAULT"
+  EXIT_IP_RETRIES="$EXIT_IP_RETRIES_DEFAULT"
+  EXIT_IP_DELAY="$EXIT_IP_DELAY_DEFAULT"
+  EXIT_IP_MAX_TIME="$EXIT_IP_MAX_TIME_DEFAULT"
+  EXIT_IP_URL="$EXIT_IP_URL_DEFAULT"
+  WARP_ENDPOINT_HOST="$WARP_ENDPOINT_HOST_DEFAULT"
+  WARP_ENDPOINT_PORTS="$WARP_ENDPOINT_PORTS_DEFAULT"
+  WARP_HANDSHAKE_WAIT="$WARP_HANDSHAKE_WAIT_DEFAULT"
+  WARP_HANDSHAKE_TRY_WAIT="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
   UPLINK_IF=""
 
   local old_count=""
@@ -409,7 +588,9 @@ cmd_install() {
   local i conf
   for i in $(seq 1 "$COUNT"); do
     conf="$(cfg_path "$i")"
-    if [[ ! -f "$conf" ]]; then
+    if [[ -f "$conf" ]]; then
+      normalize_warp_conf "$i" "$conf"
+    else
       gen_warp_conf "$i"
       if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
         sleep "$REGISTER_DELAY"
@@ -429,6 +610,120 @@ cmd_install() {
   cmd_proxies
 }
 
+wg_latest_handshake_ts() {
+  local ns="${1:?}"
+  local iface="${2:?}"
+  ip netns exec "$ns" wg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}' 2>/dev/null || true
+}
+
+wg_wait_handshake() {
+  local ns="${1:?}"
+  local iface="${2:?}"
+  local timeout_s="${3:-10}"
+
+  [[ "$timeout_s" =~ ^[0-9]+$ ]] || timeout_s=10
+  local end now ts
+  end=$(( $(date +%s) + timeout_s ))
+
+  while true; do
+    ts="$(wg_latest_handshake_ts "$ns" "$iface" 2>/dev/null || echo 0)"
+    if [[ "${ts:-0}" -gt 0 ]]; then
+      return 0
+    fi
+    now="$(date +%s)"
+    [[ "$now" -lt "$end" ]] || break
+    sleep 1
+  done
+  return 1
+}
+
+warp_trigger_traffic() {
+  local ns="${1:?}"
+  ip netns exec "$ns" bash -c 'echo -n x >/dev/udp/1.1.1.1/53' >/dev/null 2>&1 || true
+  ip netns exec "$ns" bash -c 'echo -n x >/dev/udp/8.8.8.8/53' >/dev/null 2>&1 || true
+}
+
+warp_try_fix_handshake() {
+  local i="${1:?}"
+  local ns="${2:?}"
+  local conf="${3:?}"
+
+  local iface peer
+  iface="${WG_PREFIX}${i}"
+  peer="$(wgconf_peer_pubkey "$conf")"
+  [[ -n "${peer:-}" ]] || return 1
+
+  local wait_s="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
+  [[ "$wait_s" =~ ^[0-9]+$ ]] || wait_s="$WARP_HANDSHAKE_WAIT_DEFAULT"
+
+  # Wait a bit for initial handshake (especially right after boot).
+  warp_trigger_traffic "$ns"
+  if wg_wait_handshake "$ns" "$iface" "$wait_s"; then
+    return 0
+  fi
+
+  local cur_ep cur_host cur_port
+  cur_ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
+  cur_host="${cur_ep%:*}"
+  cur_port="${cur_ep##*:}"
+  [[ "$cur_port" =~ ^[0-9]+$ ]] || cur_port="2408"
+
+  local host="$cur_host"
+  if [[ -z "${host:-}" ]] || is_ipv4 "$host"; then
+    host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  fi
+  [[ -n "${host:-}" ]] || host="$WARP_ENDPOINT_HOST_DEFAULT"
+
+  local -a ips=()
+  local ip preferred
+  if is_ipv4 "$cur_host"; then
+    ips+=("$cur_host")
+  fi
+  preferred="$(pick_endpoint_ipv4_for_index "$i" "$host" 2>/dev/null || true)"
+  [[ -n "${preferred:-}" ]] && ips+=("$preferred")
+  while IFS= read -r ip; do
+    [[ -n "$ip" ]] || continue
+    ips+=("$ip")
+  done < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
+
+  if [[ "${#ips[@]}" -gt 0 ]]; then
+    mapfile -t ips < <(printf '%s\n' "${ips[@]}" | awk 'NF && !seen[$0]++')
+  fi
+
+  local ports_csv ports_csv_nospace
+  ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+  ports_csv_nospace="${ports_csv//[[:space:]]/}"
+  local -a ports_raw=()
+  local -a ports=()
+  local p
+  IFS=',' read -r -a ports_raw <<<"$ports_csv_nospace"
+  ports_raw+=("$cur_port")
+  mapfile -t ports < <(printf '%s\n' "${ports_raw[@]}" \
+    | awk 'NF && $0 ~ /^[0-9]+$/ && $0 >= 1 && $0 <= 65535 && !seen[$0]++')
+
+  [[ "${#ips[@]}" -gt 0 ]] || return 1
+  [[ "${#ports[@]}" -gt 0 ]] || return 1
+
+  local try_wait="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
+  [[ "$try_wait" =~ ^[0-9]+$ ]] || try_wait="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
+
+  for p in "${ports[@]}"; do
+    for ip in "${ips[@]}"; do
+      [[ -n "$ip" ]] || continue
+      set_wgconf_endpoint "$conf" "$ip" "$p" || true
+      ip netns exec "$ns" wg set "$iface" peer "$peer" endpoint "${ip}:${p}" 2>/dev/null || true
+      warp_trigger_traffic "$ns"
+      if wg_wait_handshake "$ns" "$iface" "$try_wait"; then
+        log "warp$(printf '%02d' "$i") handshake OK via Endpoint=${ip}:${p}"
+        return 0
+      fi
+    done
+  done
+
+  warn "warp$(printf '%02d' "$i") has no handshake after trying endpoints/ports (host=${host}, ports=${ports_csv_nospace})."
+  return 1
+}
+
 cmd_ns_up() {
   require_root
   load_config
@@ -444,6 +739,7 @@ cmd_ns_up() {
   vn="$(veth_ns "$i")"
 
   [[ -f "$conf" ]] || die "Missing config: $conf (run: warp-multi install)"
+  normalize_warp_conf "$i" "$conf"
 
   ip netns del "$ns" 2>/dev/null || true
   ip link del "$vh" 2>/dev/null || true
@@ -458,19 +754,25 @@ cmd_ns_up() {
   ip netns exec "$ns" ip addr add "${nsip}/24" dev "$vn"
   ip netns exec "$ns" ip link set "$vn" up
   ip netns exec "$ns" ip link set lo up
+
+  # Ensure IPv6 is enabled inside the namespace (WARP often provides IPv6 even on IPv4-only servers).
+  ip netns exec "$ns" sysctl -q -w \
+    net.ipv6.conf.all.disable_ipv6=0 \
+    net.ipv6.conf.default.disable_ipv6=0 \
+    net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || true
+
   ip netns exec "$ns" ip route add default via "$hostip"
 
-  mkdir -p "/etc/netns/$ns"
-  cat >"/etc/netns/$ns/resolv.conf" <<EOFRES
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-EOFRES
+  write_netns_resolv_conf "$ns"
 
   ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
   ipt_ensure_top filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
   ipt_ensure_top filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
   ip netns exec "$ns" wg-quick up "$conf" >/dev/null
+
+  # Best-effort recovery for providers/networks where the default endpoint/port doesn't handshake.
+  warp_try_fix_handshake "$i" "$ns" "$conf" || true
 }
 
 cmd_ns_down() {
@@ -486,9 +788,10 @@ cmd_ns_down() {
 
   ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
 
-  ipt -t nat -D POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE 2>/dev/null || true
-  ipt -D FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || true
-  ipt -D FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ipt_delete_all nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+  ipt_delete_all filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
+  ipt_delete_all filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  ipt_delete_all filter FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
   ip link del "$vh" 2>/dev/null || true
   ip netns del "$ns" 2>/dev/null || true
@@ -521,19 +824,44 @@ get_exit_ip() {
     return 20
   fi
 
-  # Prefer IPv6 (WARP usually provides it even on IPv4-only servers); fall back to IPv4.
-  local out ip
-  out="$(ip netns exec "$ns" curl -6 -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-  ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
-  if [[ -n "${ip:-}" ]]; then
-    echo "$ip"
-    return 0
-  fi
+  local retries delay max_time url
+  retries="${EXIT_IP_RETRIES:-$EXIT_IP_RETRIES_DEFAULT}"
+  delay="${EXIT_IP_DELAY:-$EXIT_IP_DELAY_DEFAULT}"
+  max_time="${EXIT_IP_MAX_TIME:-$EXIT_IP_MAX_TIME_DEFAULT}"
+  url="${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}"
 
-  out="$(ip netns exec "$ns" curl -4 -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-  ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
-  [[ -n "${ip:-}" ]] || return 1
-  echo "$ip"
+  [[ "$retries" =~ ^[0-9]+$ ]] || retries="$EXIT_IP_RETRIES_DEFAULT"
+  [[ "$delay" =~ ^[0-9]+$ ]] || delay="$EXIT_IP_DELAY_DEFAULT"
+  [[ "$max_time" =~ ^[0-9]+$ ]] || max_time="$EXIT_IP_MAX_TIME_DEFAULT"
+  [[ -n "${url:-}" ]] || url="$EXIT_IP_URL_DEFAULT"
+
+  [[ "$retries" -ge 1 ]] || retries=1
+
+  # Prefer IPv6 (WARP usually provides it even on IPv4-only servers); fall back to IPv4.
+  local attempt out ip
+  for attempt in $(seq 1 "$retries"); do
+    if out="$(netns_curl "$ns" -6 -fsS --max-time "$max_time" "$url")"; then
+      ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
+      if [[ -n "${ip:-}" ]]; then
+        echo "$ip"
+        return 0
+      fi
+    fi
+
+    if out="$(netns_curl "$ns" -4 -fsS --max-time "$max_time" "$url")"; then
+      ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
+      if [[ -n "${ip:-}" ]]; then
+        echo "$ip"
+        return 0
+      fi
+    fi
+
+    if [[ "$attempt" -lt "$retries" ]] && [[ "$delay" -gt 0 ]]; then
+      sleep "$delay"
+    fi
+  done
+
+  return 1
 }
 
 cmd_ip() {
@@ -556,14 +884,15 @@ cmd_ip() {
 
 cmd_ips() {
   load_config
-  local i ns ip
+  local i ns ip rc
   for i in $(seq 1 "$COUNT"); do
     ns="$(ns_name "$i")"
     printf "warp%02d: " "$i"
     if ip="$(get_exit_ip "$ns")"; then
       echo "$ip"
     else
-      if [[ "$?" -eq 20 ]]; then
+      rc=$?
+      if [[ "$rc" -eq 20 ]]; then
         echo "MISSING_NETNS"
       else
         echo "N/A"
