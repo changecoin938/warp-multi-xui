@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.6"
+VERSION="0.1.7"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -1220,14 +1220,22 @@ cmd_restart() {
   local which="${1:-all}"
   if [[ "$which" == "all" ]]; then
     local i
+    local failed=0
     for i in $(seq 1 "$COUNT"); do
-      systemctl restart "warp-netns@${i}.service" "warp-socks@${i}.service"
+      if ! systemctl restart --no-block "warp-netns@${i}.service" "warp-socks@${i}.service" >/dev/null 2>&1; then
+        failed=1
+        warn "warp$(printf '%02d' "$i") restart returned an error. Check: journalctl -u warp-netns@${i} -e --no-pager"
+      fi
     done
+    [[ "$failed" -eq 0 ]] || return 1
     return 0
   fi
 
   [[ "$which" =~ ^[0-9]+$ ]] || die "Usage: warp-multi restart <index|all>"
-  systemctl restart "warp-netns@${which}.service" "warp-socks@${which}.service"
+  if ! systemctl restart --no-block "warp-netns@${which}.service" "warp-socks@${which}.service" >/dev/null 2>&1; then
+    warn "warp$(printf '%02d' "$which") restart returned an error. Check: journalctl -u warp-netns@${which} -e --no-pager"
+    return 1
+  fi
 }
 
 cmd_rotate() {
@@ -1245,7 +1253,9 @@ cmd_rotate() {
   gen_warp_conf "$i"
   set_unused_warp_endpoint "$i" "$(cfg_path "$i")" || true
 
-  systemctl start "warp-netns@${i}.service" "warp-socks@${i}.service"
+  if ! systemctl start --no-block "warp-netns@${i}.service" "warp-socks@${i}.service" >/dev/null 2>&1; then
+    warn "warp$(printf '%02d' "$i") failed to start via systemd. Check: journalctl -u warp-netns@${i} -e --no-pager"
+  fi
 
   sleep 2
   log "New exit IP for warp$(printf '%02d' "$i"): $(cmd_ip "$i")"
