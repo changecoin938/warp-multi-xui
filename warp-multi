@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.7"
+VERSION="0.1.8"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -1152,20 +1152,21 @@ get_exit_ip() {
 cmd_ip() {
   load_config
   local i="${1:?}"
-  local ns
+  local ns ip rc
   ns="$(ns_name "$i")"
-  local ip rc
-  ip="$(get_exit_ip "$ns")"
-  rc=$?
-  if [[ "$rc" -eq 0 ]]; then
+
+  # NOTE: run get_exit_ip in an `if` so `set -e` doesn't abort on non-zero rc.
+  if ip="$(get_exit_ip "$ns")"; then
     echo "$ip"
     return 0
   fi
+  rc=$?
   if [[ "$rc" -eq 20 ]]; then
     echo "MISSING_NETNS"
-  else
-    echo "N/A"
+    return 0
   fi
+  echo "N/A"
+  return 0
 }
 
 cmd_ips() {
@@ -1174,11 +1175,10 @@ cmd_ips() {
   for i in $(seq 1 "$COUNT"); do
     ns="$(ns_name "$i")"
     printf "warp%02d: " "$i"
-    ip="$(get_exit_ip "$ns")"
-    rc=$?
-    if [[ "$rc" -eq 0 ]]; then
+    if ip="$(get_exit_ip "$ns")"; then
       echo "$ip"
     else
+      rc=$?
       if [[ "$rc" -eq 20 ]]; then
         echo "MISSING_NETNS"
       else
