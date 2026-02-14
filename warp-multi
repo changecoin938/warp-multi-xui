@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.3"
+VERSION="0.1.4"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -44,6 +44,11 @@ WARP_ENDPOINT_HOST_DEFAULT="engage.cloudflareclient.com"
 WARP_ENDPOINT_PORTS_DEFAULT="2408,500,1701,4500"
 WARP_HANDSHAKE_WAIT_DEFAULT=12
 WARP_HANDSHAKE_TRY_WAIT_DEFAULT=6
+
+# Auto-recover dead/stale WARP accounts (only after handshake fails and we already tried endpoints/ports)
+AUTORENEW_ON_FAIL_DEFAULT=1
+AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT=86400   # seconds (1 day); applies to auto re-register
+AUTORENEW_COOLDOWN_DEFAULT=21600          # seconds (6 hours) between auto attempts per tunnel
 
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
@@ -90,6 +95,100 @@ pick_endpoint_ipv4_for_index() {
   echo "${ips[$idx]}"
 }
 
+parse_ports_csv() {
+  local csv="${1:-}"
+  csv="${csv//[[:space:]]/}"
+  local -a raw=()
+  IFS=',' read -r -a raw <<<"$csv"
+  printf '%s\n' "${raw[@]}" \
+    | awk 'NF && $0 ~ /^[0-9]+$/ && $0 >= 1 && $0 <= 65535 && !seen[$0]++'
+}
+
+wgconf_endpoint() {
+  local conf="${1:?}"
+  local ep host port
+  ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
+  host="${ep%:*}"
+  port="${ep##*:}"
+  if is_ipv4 "$host" && [[ "$port" =~ ^[0-9]+$ ]]; then
+    echo "${host}:${port}"
+  fi
+}
+
+list_active_endpoints() {
+  local skip_i="${1:?}"
+  local i conf active ep
+  for i in $(seq 1 "$COUNT"); do
+    [[ "$i" -eq "$skip_i" ]] && continue
+    active="$(systemctl is-active "warp-netns@${i}.service" 2>/dev/null || true)"
+    [[ "$active" == "active" ]] || continue
+    conf="$(cfg_path "$i")"
+    [[ -f "$conf" ]] || continue
+    ep="$(wgconf_endpoint "$conf" 2>/dev/null || true)"
+    [[ -n "${ep:-}" ]] && echo "$ep"
+  done
+}
+
+pick_endpoint_combo_for_index() {
+  local i="${1:?}"
+  local host="${2:?}"
+  local ports_csv="${3:-}"
+
+  local -a ips=()
+  mapfile -t ips < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
+  [[ "${#ips[@]}" -gt 0 ]] || return 1
+
+  local -a ports=()
+  mapfile -t ports < <(parse_ports_csv "$ports_csv" 2>/dev/null || true)
+  [[ "${#ports[@]}" -gt 0 ]] || return 1
+
+  local total=$(( ${#ips[@]} * ${#ports[@]} ))
+  local idx=$(( (i - 1) % total ))
+  local ip_idx=$(( idx / ${#ports[@]} ))
+  local port_idx=$(( idx % ${#ports[@]} ))
+  echo "${ips[$ip_idx]}:${ports[$port_idx]}"
+}
+
+pick_unused_endpoint_combo() {
+  local i="${1:?}"
+  local host="${2:?}"
+  local ports_csv="${3:-}"
+
+  local -a ips=()
+  mapfile -t ips < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
+  [[ "${#ips[@]}" -gt 0 ]] || return 1
+
+  local -a ports=()
+  mapfile -t ports < <(parse_ports_csv "$ports_csv" 2>/dev/null || true)
+  [[ "${#ports[@]}" -gt 0 ]] || return 1
+
+  local total=$(( ${#ips[@]} * ${#ports[@]} ))
+  local start=$(( (i - 1) % total ))
+
+  declare -A used=()
+  local ep
+  while IFS= read -r ep; do
+    [[ -n "${ep:-}" ]] || continue
+    used["$ep"]=1
+  done < <(list_active_endpoints "$i" 2>/dev/null || true)
+
+  local off idx ip_idx port_idx combo
+  for off in $(seq 0 $((total - 1))); do
+    idx=$(( (start + off) % total ))
+    ip_idx=$(( idx / ${#ports[@]} ))
+    port_idx=$(( idx % ${#ports[@]} ))
+    combo="${ips[$ip_idx]}:${ports[$port_idx]}"
+    if [[ -z "${used[$combo]:-}" ]]; then
+      echo "$combo"
+      return 0
+    fi
+  done
+
+  ip_idx=$(( start / ${#ports[@]} ))
+  port_idx=$(( start % ${#ports[@]} ))
+  echo "${ips[$ip_idx]}:${ports[$port_idx]}"
+}
+
 ensure_defaults() {
   COUNT="${COUNT:-$COUNT_DEFAULT}"
   BASE_PORT="${BASE_PORT:-$BASE_PORT_DEFAULT}"
@@ -115,6 +214,10 @@ ensure_defaults() {
   WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
   WARP_HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
   WARP_HANDSHAKE_TRY_WAIT="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
+
+  AUTORENEW_ON_FAIL="${AUTORENEW_ON_FAIL:-$AUTORENEW_ON_FAIL_DEFAULT}"
+  AUTORENEW_MIN_ACCOUNT_AGE="${AUTORENEW_MIN_ACCOUNT_AGE:-$AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT}"
+  AUTORENEW_COOLDOWN="${AUTORENEW_COOLDOWN:-$AUTORENEW_COOLDOWN_DEFAULT}"
 }
 
 load_config() {
@@ -148,6 +251,9 @@ save_config() {
     printf 'WARP_ENDPOINT_PORTS=%q\n' "$WARP_ENDPOINT_PORTS"
     printf 'WARP_HANDSHAKE_WAIT=%q\n' "$WARP_HANDSHAKE_WAIT"
     printf 'WARP_HANDSHAKE_TRY_WAIT=%q\n' "$WARP_HANDSHAKE_TRY_WAIT"
+    printf 'AUTORENEW_ON_FAIL=%q\n' "$AUTORENEW_ON_FAIL"
+    printf 'AUTORENEW_MIN_ACCOUNT_AGE=%q\n' "$AUTORENEW_MIN_ACCOUNT_AGE"
+    printf 'AUTORENEW_COOLDOWN=%q\n' "$AUTORENEW_COOLDOWN"
   } >"$CONFIG_FILE"
 }
 
@@ -233,6 +339,56 @@ cfg_path() {
 state_path() {
   local i="$1"
   echo "${STATE_DIR}/${WG_PREFIX}${i}"
+}
+
+account_created_at_path() {
+  local i="$1"
+  echo "$(state_path "$i")/created_at"
+}
+
+read_epoch_file() {
+  local path="${1:?}"
+  local ts=""
+  if [[ -f "$path" ]]; then
+    read -r ts <"$path" 2>/dev/null || true
+  fi
+  [[ "${ts:-}" =~ ^[0-9]+$ ]] || ts="0"
+  echo "$ts"
+}
+
+autorenew_marker_path() {
+  local i="${1:?}"
+  echo "${STATE_DIR}/autorenew/${WG_PREFIX}${i}.ts"
+}
+
+autorenew_allowed() {
+  [[ "${AUTORENEW_ON_FAIL:-$AUTORENEW_ON_FAIL_DEFAULT}" == "1" ]] || return 1
+
+  local i="${1:?}"
+  local now created min_age last cooldown
+  now="$(date +%s)"
+
+  created="$(read_epoch_file "$(account_created_at_path "$i")")"
+  min_age="${AUTORENEW_MIN_ACCOUNT_AGE:-$AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT}"
+  [[ "$min_age" =~ ^[0-9]+$ ]] || min_age="$AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT"
+  if [[ "$created" -gt 0 ]] && [[ $((now - created)) -lt "$min_age" ]]; then
+    return 1
+  fi
+
+  last="$(read_epoch_file "$(autorenew_marker_path "$i")")"
+  cooldown="${AUTORENEW_COOLDOWN:-$AUTORENEW_COOLDOWN_DEFAULT}"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown="$AUTORENEW_COOLDOWN_DEFAULT"
+  if [[ "$last" -gt 0 ]] && [[ $((now - last)) -lt "$cooldown" ]]; then
+    return 1
+  fi
+
+  return 0
+}
+
+mark_autorenew_attempt() {
+  local i="${1:?}"
+  mkdir -p "${STATE_DIR}/autorenew" 2>/dev/null || true
+  date +%s >"$(autorenew_marker_path "$i")" 2>/dev/null || true
 }
 
 ns_name() {
@@ -388,7 +544,7 @@ pin_warp_endpoint() {
   local i="${1:?}"
   local conf="${2:?}"
 
-  local cur_ep cur_host cur_port host ip
+  local cur_ep cur_host cur_port host ports_csv combo ip port
   cur_ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
   cur_host="${cur_ep%:*}"
   cur_port="${cur_ep##*:}"
@@ -405,10 +561,14 @@ pin_warp_endpoint() {
   fi
   [[ -n "${host:-}" ]] || return 0
 
-  ip="$(pick_endpoint_ipv4_for_index "$i" "$host" 2>/dev/null || true)"
-  [[ -n "${ip:-}" ]] || return 0
+  ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT},${cur_port}"
+  combo="$(pick_endpoint_combo_for_index "$i" "$host" "$ports_csv" 2>/dev/null || true)"
+  [[ -n "${combo:-}" ]] || return 0
 
-  set_wgconf_endpoint "$conf" "$ip" "$cur_port" || true
+  ip="${combo%:*}"
+  port="${combo##*:}"
+  [[ "$port" =~ ^[0-9]+$ ]] || port="$cur_port"
+  set_wgconf_endpoint "$conf" "$ip" "$port" || true
 }
 
 normalize_warp_conf() {
@@ -427,6 +587,23 @@ normalize_warp_conf() {
   pin_warp_endpoint "$i" "$conf" || true
 
   chmod 600 "$conf" 2>/dev/null || true
+}
+
+set_unused_warp_endpoint() {
+  local i="${1:?}"
+  local conf="${2:?}"
+
+  local host ports_csv combo ip port
+  host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+
+  combo="$(pick_unused_endpoint_combo "$i" "$host" "$ports_csv" 2>/dev/null || true)"
+  [[ -n "${combo:-}" ]] || return 0
+
+  ip="${combo%:*}"
+  port="${combo##*:}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 0
+  set_wgconf_endpoint "$conf" "$ip" "$port" || true
 }
 
 gen_warp_conf() {
@@ -449,6 +626,12 @@ gen_warp_conf() {
     cd "$dir"
     umask 077
     rm -f wgcf-account.toml wgcf-profile.conf
+
+    # Serialize wgcf register/generate across parallel systemd units.
+    if command -v flock >/dev/null 2>&1; then
+      exec 9>/run/warp-multi-wgcf.lock
+      flock -x 9
+    fi
 
     attempt=1
     while true; do
@@ -475,6 +658,7 @@ gen_warp_conf() {
 
     out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
     cp wgcf-profile.conf "$conf"
+    date +%s >created_at
   ); then
     :
   else
@@ -550,6 +734,9 @@ cmd_install() {
   WARP_ENDPOINT_PORTS="$WARP_ENDPOINT_PORTS_DEFAULT"
   WARP_HANDSHAKE_WAIT="$WARP_HANDSHAKE_WAIT_DEFAULT"
   WARP_HANDSHAKE_TRY_WAIT="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
+  AUTORENEW_ON_FAIL="$AUTORENEW_ON_FAIL_DEFAULT"
+  AUTORENEW_MIN_ACCOUNT_AGE="$AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT"
+  AUTORENEW_COOLDOWN="$AUTORENEW_COOLDOWN_DEFAULT"
   UPLINK_IF=""
 
   local old_count=""
@@ -801,6 +988,28 @@ cmd_ns_up() {
 
   # If the tunnel doesn't handshake, fail the unit so systemd doesn't mark it active.
   if ! warp_try_fix_handshake "$i" "$ns" "$conf"; then
+    # If this is a stale/dead WARP account, try one auto re-register/renew (rate-limit guarded).
+    if autorenew_allowed "$i"; then
+      warn "warp$(printf '%02d' "$i") handshake failed; attempting auto renew (wgcf re-register) once."
+      mark_autorenew_attempt "$i"
+
+      if (
+        set -euo pipefail
+        ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
+        rm -f "$conf" 2>/dev/null || true
+        rm -rf "$(state_path "$i")" 2>/dev/null || true
+
+        gen_warp_conf "$i"
+        conf="$(cfg_path "$i")"
+        set_unused_warp_endpoint "$i" "$conf" || true
+
+        ip netns exec "$ns" wg-quick up "$conf" >/dev/null
+        warp_try_fix_handshake "$i" "$ns" "$conf"
+      ); then
+        return 0
+      fi
+    fi
+
     warn "warp$(printf '%02d' "$i") handshake failed; cleaning up netns."
     cmd_ns_down "$i" 2>/dev/null || true
     die "warp$(printf '%02d' "$i") has no WireGuard handshake. Try: warp-multi rotate $i"
@@ -989,11 +1198,60 @@ cmd_rotate() {
   rm -rf "$(state_path "$i")" || true
 
   gen_warp_conf "$i"
+  set_unused_warp_endpoint "$i" "$(cfg_path "$i")" || true
 
   systemctl start "warp-netns@${i}.service" "warp-socks@${i}.service"
 
   sleep 2
   log "New exit IP for warp$(printf '%02d' "$i"): $(cmd_ip "$i")"
+}
+
+cmd_renew() {
+  require_root
+  load_config
+
+  local i="${1:?}"
+  [[ "$i" =~ ^[0-9]+$ ]] || die "Usage: warp-multi renew <index>"
+
+  local ns conf
+  ns="$(ns_name "$i")"
+  conf="$(cfg_path "$i")"
+
+  if ! netns_exists "$ns"; then
+    warn "Namespace '$ns' is missing; falling back to rotate (will restart SOCKS)."
+    cmd_rotate "$i"
+    return 0
+  fi
+  [[ -f "$conf" ]] || die "Missing config: $conf (run: warp-multi install)"
+
+  (
+    set -euo pipefail
+    ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
+    rm -f "$conf" 2>/dev/null || true
+    rm -rf "$(state_path "$i")" 2>/dev/null || true
+
+    gen_warp_conf "$i"
+    conf="$(cfg_path "$i")"
+    set_unused_warp_endpoint "$i" "$conf" || true
+
+    ip netns exec "$ns" wg-quick up "$conf" >/dev/null
+    warp_try_fix_handshake "$i" "$ns" "$conf"
+  )
+
+  log "New exit IP for warp$(printf '%02d' "$i"): $(cmd_ip "$i")"
+}
+
+cmd_renew_all() {
+  require_root
+  load_config
+
+  local i
+  for i in $(seq 1 "$COUNT"); do
+    cmd_renew "$i"
+    if [[ "${REGISTER_DELAY:-0}" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
+      sleep "$REGISTER_DELAY"
+    fi
+  done
 }
 
 cmd_rotate_all() {
@@ -1090,6 +1348,8 @@ Commands:
   restart <i|all>          Restart one or all tunnels
   rotate <i>               Regenerate wgcf account/config for one tunnel (changes keys; usually changes exit IP)
   rotate-all               Rotate all tunnels
+  renew <i>                Re-register WARP for one tunnel without restarting SOCKS (keeps netns)
+  renew-all                Renew all tunnels
   ns-up <i>                (internal) bring up netns + wg
   ns-down <i>              (internal) bring down netns + wg
   socks <i>                (internal) run SOCKS5 proxy inside netns
@@ -1121,6 +1381,8 @@ main() {
     restart) cmd_restart "$@" ;;
     rotate) cmd_rotate "$@" ;;
     rotate-all) cmd_rotate_all "$@" ;;
+    renew) cmd_renew "$@" ;;
+    renew-all) cmd_renew_all "$@" ;;
     ns-up) cmd_ns_up "$@" ;;
     ns-down) cmd_ns_down "$@" ;;
     socks) cmd_socks "$@" ;;

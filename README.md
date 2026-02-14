@@ -48,6 +48,8 @@ warp-multi ip 3
 ```bash
 warp-multi rotate 3
 warp-multi rotate-all
+warp-multi renew 3      # بدون restart کردن SOCKS
+warp-multi renew-all
 ```
 
 ### Xray / x-ui
