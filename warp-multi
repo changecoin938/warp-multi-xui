@@ -10,7 +10,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.2.2"
+VERSION="0.2.3"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -37,6 +37,12 @@ REGISTER_DELAY_DEFAULT=8          # seconds to wait between successful registrat
 REGISTER_RETRIES_DEFAULT=8        # retries when 429 happens
 REGISTER_BACKOFF_BASE_DEFAULT=15  # exponential backoff base seconds (15,30,60,120,...)
 REGISTER_BACKOFF_MAX_DEFAULT=900  # max backoff seconds
+
+# exit IP probing (warp-multi ips/status)
+EXIT_IP_RETRIES_DEFAULT=3
+EXIT_IP_DELAY_DEFAULT=1
+EXIT_IP_MAX_TIME_DEFAULT=6
+EXIT_IP_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
 
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
@@ -569,10 +575,11 @@ cmd_install() {
       IFS=',' read -r -a auto_arr <<<"$auto_ips"
       auto_count="${#auto_arr[@]}"
     fi
-    if [[ "$auto_count" -ge 2 ]]; then
+  if [[ "$auto_count" -ge 2 ]]; then
       COUNT="$auto_count"
       EGRESS_IPS="$auto_ips"
       log "Detected ${auto_count} public IPv4 addresses on ${UPLINK_IF}; auto-setting COUNT=${auto_count} (one namespace per IPv4)."
+      log "Auto-detected uplink IPv4s: ${EGRESS_IPS}"
     fi
   fi
 
@@ -818,8 +825,24 @@ get_exit_ip() {
   if ! netns_exists "$ns"; then
     return 20
   fi
-  ip netns exec "$ns" curl -4 -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
-    | awk -F= '/^ip=/{print $2; exit}'
+  local tries delay max_time url attempt out ip
+  tries="${EXIT_IP_RETRIES:-$EXIT_IP_RETRIES_DEFAULT}"
+  delay="${EXIT_IP_DELAY:-$EXIT_IP_DELAY_DEFAULT}"
+  max_time="${EXIT_IP_MAX_TIME:-$EXIT_IP_MAX_TIME_DEFAULT}"
+  url="${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}"
+
+  for attempt in $(seq 1 "$tries"); do
+    out="$(ip netns exec "$ns" curl -4 -fsS --max-time "$max_time" "$url" 2>/dev/null || true)"
+    ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out")"
+    if [[ -n "$ip" ]]; then
+      echo "$ip"
+      return 0
+    fi
+    if [[ "$attempt" -lt "$tries" ]] && [[ "$delay" -gt 0 ]]; then
+      sleep "$delay"
+    fi
+  done
+  return 1
 }
 
 cmd_ip() {
@@ -933,13 +956,45 @@ cmd_status() {
   require_root
   load_config
 
-  local i active ip addr port
+  local i active ip addr port egress
   for i in $(seq 1 "$COUNT"); do
     active="$(systemctl is-active "warp-socks@${i}.service" 2>/dev/null || true)"
     addr="$(ns_ip "$i")"
     port="$(socks_port "$i")"
     ip="$(cmd_ip "$i" 2>/dev/null || true)"
-    printf "warp%02d  socks=%s:%s  service=%s  exit_ip=%s\n" "$i" "$addr" "$port" "${active:-unknown}" "${ip:-N/A}"
+    egress="$(egress_ip_for_index "$i")"
+    printf "warp%02d  socks=%s:%s  service=%s  egress_ip=%s  exit_ip=%s\n" \
+      "$i" "$addr" "$port" "${active:-unknown}" "${egress:-auto}" "${ip:-N/A}"
+  done
+}
+
+cmd_check_egress() {
+  load_config
+
+  local dev="${UPLINK_IF:-}"
+  if [[ -z "$dev" ]]; then
+    dev="$(detect_uplink)"
+  fi
+  [[ -n "$dev" ]] || die "Could not detect uplink interface; set in ${CONFIG_FILE} or run: warp-multi install --uplink-if <iface>"
+
+  local ips="${EGRESS_IPS:-}"
+  if [[ -z "$ips" ]]; then
+    ips="$(detect_egress_ips_csv "$dev")"
+  fi
+  [[ -n "$ips" ]] || die "No public IPv4 addresses detected on '${dev}'"
+
+  local -a arr
+  IFS=',' read -r -a arr <<<"$ips"
+
+  local ip out seen
+  for ip in "${arr[@]}"; do
+    out="$(curl -4 --interface "$ip" -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
+    seen="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out")"
+    if [[ -n "$seen" ]]; then
+      printf "%s -> %s OK\n" "$ip" "$seen"
+    else
+      printf "%s -> FAIL\n" "$ip"
+    fi
   done
 }
 
@@ -1019,6 +1074,7 @@ Commands:
   ip <i>                   Show exit IP for one tunnel
   ips                      Show exit IPs for all tunnels
   status                   Show service status + exit IPs
+  check-egress             Test uplink public IPv4 connectivity (curl --interface)
   restart <i|all>          Restart one or all tunnels
   rotate <i>               (warp) Regenerate wgcf account/config for one tunnel (changes keys; usually changes exit IP)
   rotate-all               (warp) Rotate all tunnels
@@ -1050,6 +1106,7 @@ main() {
     ip) cmd_ip "$@" ;;
     ips) cmd_ips "$@" ;;
     status) cmd_status "$@" ;;
+    check-egress) cmd_check_egress "$@" ;;
     restart) cmd_restart "$@" ;;
     rotate) cmd_rotate "$@" ;;
     rotate-all) cmd_rotate_all "$@" ;;
