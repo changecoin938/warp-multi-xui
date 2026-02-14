@@ -10,7 +10,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -336,12 +336,12 @@ strip_wgconf_ipv6() {
   local tmp
   tmp="$(mktemp)"
 
-  awk '
-    BEGIN { in_iface=0; in_peer=0 }
+  if ! awk '
+    BEGIN { in_iface=0; in_peer=0; kept_addr=0; kept_allowed=0 }
     /^\[Interface\]$/ { in_iface=1; in_peer=0; print; next }
     /^\[Peer\]$/      { in_peer=1; in_iface=0; print; next }
 
-    # Keep only IPv4 Address entries.
+    # Keep only IPv4 Address entries (supports comma-separated or repeated Address lines).
     in_iface && /^Address[[:space:]]*=/ {
       val=$0
       sub(/^Address[[:space:]]*=[[:space:]]*/, "", val)
@@ -352,10 +352,11 @@ strip_wgconf_ipv6() {
           out = (out=="" ? a[i] : out", "a[i])
         }
       }
-      if (out != "") { print "Address = " out; next }
+      if (out != "") { print "Address = " out; kept_addr=1; next }
+      next
     }
 
-    # Keep only IPv4 AllowedIPs entries.
+    # Keep only IPv4 AllowedIPs entries (supports comma-separated or repeated AllowedIPs lines).
     in_peer && /^AllowedIPs[[:space:]]*=/ {
       val=$0
       sub(/^AllowedIPs[[:space:]]*=[[:space:]]*/, "", val)
@@ -366,11 +367,19 @@ strip_wgconf_ipv6() {
           out = (out=="" ? a[i] : out", "a[i])
         }
       }
-      if (out != "") { print "AllowedIPs = " out; next }
+      if (out != "") { print "AllowedIPs = " out; kept_allowed=1; next }
+      next
     }
 
     { print }
-  ' "$conf" >"$tmp"
+
+    END {
+      if (kept_addr==0 || kept_allowed==0) exit 2
+    }
+  ' "$conf" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
 
   cat "$tmp" >"$conf"
   rm -f "$tmp"
