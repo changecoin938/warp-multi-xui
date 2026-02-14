@@ -50,7 +50,7 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 is_ipv4() {
   local ip="${1:-}"
-  [[ "$ip" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]] || return 1
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   local o1 o2 o3 o4
   IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
   for o in "$o1" "$o2" "$o3" "$o4"; do
@@ -85,7 +85,7 @@ normalize_base_net() {
   local v="${1:-}"
   v="${v//[[:space:]]/}"
   v="${v%%/*}"
-  if [[ "$v" =~ ^([0-9]{1,3})\\.([0-9]{1,3})(\\.[0-9]{1,3}){0,2}$ ]]; then
+  if [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})(\.[0-9]{1,3}){0,2}$ ]]; then
     echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
     return 0
   fi
@@ -618,7 +618,7 @@ cmd_install() {
     warn "Invalid --base-net value; falling back to default: ${BASE_NET_DEFAULT}"
     BASE_NET="$BASE_NET_DEFAULT"
   fi
-  [[ "$BASE_NET" =~ ^[0-9]{1,3}\\.[0-9]{1,3}$ ]] || die "--base-net must look like A.B (example: 10.250)"
+  [[ "$BASE_NET" =~ ^[0-9]{1,3}\.[0-9]{1,3}$ ]] || die "--base-net must look like A.B (example: 10.250)"
   local base_a base_b
   base_a="${BASE_NET%%.*}"
   base_b="${BASE_NET##*.}"
