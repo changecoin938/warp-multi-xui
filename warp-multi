@@ -10,7 +10,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.2.3"
+VERSION="0.2.4"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -335,6 +335,18 @@ netns_exists() {
 
 ipt() {
   iptables -w 5 "$@"
+}
+
+ipt_ensure_top() {
+  local table="${1:?}"
+  local chain="${2:?}"
+  shift 2
+
+  # Remove any duplicates then insert at the top, so we win over generic firewall/NAT rules.
+  while ipt -t "$table" -C "$chain" "$@" 2>/dev/null; do
+    ipt -t "$table" -D "$chain" "$@" 2>/dev/null || break
+  done
+  ipt -t "$table" -I "$chain" 1 "$@"
 }
 
 strip_wgconf_ipv6() {
@@ -748,18 +760,13 @@ EOFRES
     [[ -n "$egress_ip" ]] || die "MODE=snat requires a matching EGRESS_IPS entry for index $i"
   fi
   if [[ -n "$egress_ip" ]]; then
-    ipt -t nat -C POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip" 2>/dev/null || \
-      ipt -t nat -A POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip"
+    ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip"
   else
-    ipt -t nat -C POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE 2>/dev/null || \
-      ipt -t nat -A POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+    ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
   fi
 
-  ipt -C FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || \
-    ipt -A FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
-
-  ipt -C FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    ipt -A FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  ipt_ensure_top filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
+  ipt_ensure_top filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
   if [[ "$MODE" == "warp" ]]; then
     strip_wgconf_ipv6 "$conf" || true
@@ -949,6 +956,9 @@ cmd_rotate_all() {
   local i
   for i in $(seq 1 "$COUNT"); do
     cmd_rotate "$i"
+    if [[ "${REGISTER_DELAY:-0}" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
+      sleep "$REGISTER_DELAY"
+    fi
   done
 }
 
