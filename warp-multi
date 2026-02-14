@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.5"
+VERSION="0.1.6"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -77,6 +77,26 @@ is_ipv6() {
   [[ "$ip" == *:* ]] || return 1
   [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
   return 0
+}
+
+normalize_endpoint_host() {
+  local host="${1:-}"
+  host="${host//[[:space:]]/}"
+
+  # If user mistakenly provided host:port, strip the port.
+  if [[ "$host" == *:* ]] && ! is_ipv6 "$host"; then
+    host="${host%%:*}"
+  fi
+
+  if [[ -z "${host:-}" ]] || is_ipv4 "$host" || is_ipv6 "$host"; then
+    echo "$WARP_ENDPOINT_HOST_DEFAULT"
+    return 0
+  fi
+  echo "$host"
+}
+
+warp_endpoint_host() {
+  normalize_endpoint_host "${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
 }
 
 resolve_endpoint_ipv4s() {
@@ -211,6 +231,7 @@ ensure_defaults() {
   EXIT_IP_URL="${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}"
 
   WARP_ENDPOINT_HOST="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  WARP_ENDPOINT_HOST="$(normalize_endpoint_host "$WARP_ENDPOINT_HOST")"
   WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
   WARP_HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
   WARP_HANDSHAKE_TRY_WAIT="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
@@ -557,7 +578,7 @@ pin_warp_endpoint() {
 
   host="$cur_host"
   if [[ -z "${host:-}" ]] || [[ "$host" == "$WARP_ENDPOINT_HOST_DEFAULT" ]]; then
-    host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+    host="$(warp_endpoint_host)"
   fi
   [[ -n "${host:-}" ]] || return 0
 
@@ -594,7 +615,7 @@ set_unused_warp_endpoint() {
   local conf="${2:?}"
 
   local host ports_csv combo ip port
-  host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+  host="$(warp_endpoint_host)"
   ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
 
   combo="$(pick_unused_endpoint_combo "$i" "$host" "$ports_csv" 2>/dev/null || true)"
@@ -746,9 +767,10 @@ cmd_install() {
   fi
 
   # parse flags
+  local user_set_count=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --count) COUNT="${2:?}"; shift 2 ;;
+      --count) COUNT="${2:?}"; user_set_count=1; shift 2 ;;
       --base-port) BASE_PORT="${2:?}"; shift 2 ;;
       --base-net) BASE_NET="${2:?}"; shift 2 ;;
       --ns-prefix) NS_PREFIX="${2:?}"; shift 2 ;;
@@ -786,6 +808,19 @@ cmd_install() {
   [[ -n "${UPLINK_IF:-}" ]] || die "Could not detect uplink interface; set with --uplink-if <iface> (hint: ip -4 route show default)"
   ip link show "$UPLINK_IF" >/dev/null 2>&1 || die "Uplink interface '$UPLINK_IF' not found. Pick the interface from: ip -4 route show default"
 
+  # If user didn't set --count and we have multiple public IPv4s, default to one tunnel per IPv4.
+  if [[ "$user_set_count" -eq 0 ]] && [[ "$COUNT" -eq "$COUNT_DEFAULT" ]]; then
+    local ip4_count
+    ip4_count="$(ip -4 -o addr show dev "$UPLINK_IF" scope global 2>/dev/null \
+      | awk '{print $4}' | cut -d/ -f1 \
+      | awk 'NF && !seen[$0]++' | wc -l | tr -d '[:space:]' || true)"
+    [[ "${ip4_count:-0}" =~ ^[0-9]+$ ]] || ip4_count=0
+    if [[ "$ip4_count" -ge 2 ]]; then
+      COUNT="$ip4_count"
+      log "Detected ${ip4_count} public IPv4 addresses on ${UPLINK_IF}; auto-setting COUNT=${COUNT}."
+    fi
+  fi
+
   if ! has_cmd apt-get; then
     die "Installer supports Ubuntu/Debian (apt) only."
   fi
@@ -801,6 +836,7 @@ cmd_install() {
 
   mkdir -p "$STATE_DIR" "$WG_DIR"
   local i conf
+  local start_failed=0
   for i in $(seq 1 "$COUNT"); do
     conf="$(cfg_path "$i")"
     if [[ -f "$conf" ]]; then
@@ -811,7 +847,11 @@ cmd_install() {
         sleep "$REGISTER_DELAY"
       fi
     fi
-    systemctl enable --now "warp-netns@${i}.service" "warp-socks@${i}.service"
+    systemctl enable --quiet "warp-netns@${i}.service" "warp-socks@${i}.service" 2>/dev/null || true
+    if ! systemctl start --no-block "warp-netns@${i}.service" "warp-socks@${i}.service" >/dev/null 2>&1; then
+      start_failed=1
+      warn "warp$(printf '%02d' "$i") failed to start via systemd. Check: journalctl -u warp-netns@${i} -e --no-pager"
+    fi
   done
 
   # If count got smaller, stop/disable the old extra services
@@ -823,6 +863,10 @@ cmd_install() {
 
   log "Installed. SOCKS5 endpoints:"
   cmd_proxies
+
+  if [[ "$start_failed" -eq 1 ]]; then
+    warn "Some tunnels didn't start cleanly. systemd will retry (Restart=on-failure). Check: warp-multi status"
+  fi
 }
 
 wg_latest_handshake_ts() {
@@ -885,7 +929,7 @@ warp_try_fix_handshake() {
 
   local host="$cur_host"
   if [[ -z "${host:-}" ]] || is_ipv4 "$host"; then
-    host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
+    host="$(warp_endpoint_host)"
   fi
   [[ -n "${host:-}" ]] || host="$WARP_ENDPOINT_HOST_DEFAULT"
 
@@ -1154,7 +1198,8 @@ cmd_up() {
 
   local i
   for i in $(seq 1 "$COUNT"); do
-    systemctl enable --now "warp-netns@${i}.service" "warp-socks@${i}.service"
+    systemctl enable --quiet "warp-netns@${i}.service" "warp-socks@${i}.service" 2>/dev/null || true
+    systemctl start --no-block "warp-netns@${i}.service" "warp-socks@${i}.service" >/dev/null 2>&1 || true
   done
 }
 

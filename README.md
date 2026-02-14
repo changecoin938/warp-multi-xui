@@ -14,13 +14,15 @@
 Root-only:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) --count 10
+bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh)
 ```
+
+اگر روی سرور چند IPv4 داشته باشی، اسکریپت به‌صورت پیش‌فرض **به تعداد IPv4ها** تونل می‌سازد. (برای override از `--count` استفاده کن.)
 
 با sudo:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh | sudo bash -s -- --count 10
+curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh | sudo bash -s --
 ```
 
 اگر auto-detect اینترفیس مشکل داشت:
