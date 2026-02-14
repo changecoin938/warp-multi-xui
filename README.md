@@ -4,14 +4,12 @@
 
 هر خروجی داخل یک **Network Namespace** جدا ساخته می‌شود تا از بقیه مستقل باشد.
 
-## حالت‌ها (Modes)
+## ویژگی‌ها
 
-- `warp` (پیش‌فرض): هر Namespace یک تونل **Cloudflare WARP (WireGuard/wgcf)** + یک SOCKS5 دارد.
-  - نکته: **WARP تضمین IP یکتا نمی‌دهد**؛ ممکن است چند تونل IP خروجی یکسان داشته باشند.
-  - فقط **IPv4** (IPv6 داخل Namespace غیرفعال است و کانفیگ WARP IPv4-only می‌شود)
-- `snat` (پیشنهادی برای IP یکتا): هر Namespace ترافیک را با **SNAT از یکی از IPv4های عمومی سرور** خارج می‌کند + یک SOCKS5 دارد.
-  - **فقط IPv4** (IPv6 داخل Namespace غیرفعال می‌شود)
-  - اگر تعداد خروجی‌ها `<=` تعداد IPv4های عمومی سرور باشد، IP خروجی‌ها تکراری نمی‌شوند.
+- **خودکار**: تعداد IPv4های عمومی روی uplink را تشخیص می‌دهد و به همان تعداد Namespace/SOCKS می‌سازد.
+- **IPv4-only**: داخل هر Namespace، IPv6 غیرفعال است و کانفیگ WireGuard هم IPv4-only می‌شود.
+- **WARP جدا برای هر IPv4**: اگر چند IPv4 عمومی داشته باشید، `wgcf register/generate` برای هر خروجی از همان IPv4 انجام می‌شود (تا هر تونل واقعاً جدا باشد).
+- نکته مهم: **Cloudflare WARP تضمین IP خروجی یکتا نمی‌دهد**؛ ممکن است چند تونل هنوز IP خروجی یکسان داشته باشند.
 
 ## پیش‌نیازها
 
@@ -21,48 +19,22 @@
 
 ## نصب سریع
 
-### 1) نصب پیش‌فرض (WARP)
-
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) --uplink-if enp1s0
 ```
 
-اگر روی اینترفیس uplink حداقل ۲ IPv4 عمومی داشته باشی، اسکریپت به‌صورت خودکار:
+اگر `--uplink-if` را ندهید، اسکریپت خودش از route پیش‌فرض تشخیص می‌دهد.
 
-- `COUNT` را برابر تعداد IPv4ها می‌گذارد (مثلاً ۵ IP → ۵ SOCKS)
-- برای هر Namespace یک **SNAT** از یکی از IPv4های سرور می‌گذارد تا اتصال WARP هر Namespace از یک IPv4 متفاوت ساخته شود
+دستور بالا به صورت پیش‌فرض:
 
-نکته: با این کار **احتمال تکراری شدن IP خروجی WARP کمتر می‌شود** ولی همچنان **WARP تضمین IP یکتا نمی‌دهد**.
-
-اگر می‌خواهی تعداد را دستی تعیین کنی:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) --mode warp --count 10
-```
-
-### 2) IP یکتا با IPv4های خود سرور (SNAT)
-
-اگر می‌خواهی IP خروجی‌ها حتماً تکراری نشوند، از `snat` استفاده کن (در این حالت خروجی‌ها **IPهای خود سرور** هستند، نه WARP):
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) \
-  --snat \
-  --uplink-if enp1s0
-```
-
-اگر می‌خواهی دستی لیست IPv4ها را بدهی:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) \
-  --snat \
-  --uplink-if enp1s0 \
-  --egress-ips 66.42.99.108,207.246.107.105,149.28.67.8,144.202.119.26,66.42.99.28
-```
+- تعداد IPv4های عمومی روی uplink را پیدا می‌کند و `COUNT` را همان عدد می‌گذارد (مثلاً ۵ IP → ۵ SOCKS)
+- برای هر خروجی یک Namespace + یک SOCKS می‌سازد
+- برای هر خروجی، WARP جداگانه می‌سازد و از همان IPv4 ثبت‌نام می‌کند
 
 اگر wgcf خطای `429` یا `401/403` داد، معمولاً با delay بیشتر بهتر می‌شود:
 
 ```bash
-warp-multi install --mode warp --count 10 --register-delay 12 --register-retries 10
+warp-multi install --register-delay 12 --register-retries 10
 ```
 
 ## استفاده
@@ -85,6 +57,14 @@ warp-multi ips
 warp-multi status
 ```
 
+## (اختیاری) خروجی‌های یکتا با IPهای خود سرور
+
+اگر «IP یکتا» می‌خواهید و WARP برای شما IP تکراری می‌دهد، تنها راه قطعی این است که از IPv4های خود سرور به صورت SNAT خروجی بگیرید (این خروجی‌ها **WARP نیستند**):
+
+```bash
+warp-multi install --snat --uplink-if enp1s0
+```
+
 ## اتصال به x-ui / Xray
 
 برای هر SOCKS یک outbound از نوع **SOCKS** بساز:
@@ -102,6 +82,12 @@ warp-multi status
 systemctl status warp-netns@1 warp-socks@1 --no-pager
 journalctl -u warp-netns@1 -e --no-pager
 journalctl -u warp-socks@1 -e --no-pager
+```
+
+بررسی اینکه همه IPv4های uplink واقعاً خروجی دارند:
+
+```bash
+warp-multi check-egress
 ```
 
 اگر `warp-multi ips` گفت `MISSING_NETNS`:
