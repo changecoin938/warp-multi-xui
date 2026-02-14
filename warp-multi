@@ -482,29 +482,29 @@ cmd_install() {
     old_count="${COUNT:-}"
   fi
 
-  local install_argc="$#"
   local count_set=0
   local mode_set=0
   local egress_ips_set=0
+  local auto_ok=1
 
   # parse flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --count) COUNT="${2:?}"; count_set=1; shift 2 ;;
-      --base-port) BASE_PORT="${2:?}"; shift 2 ;;
-      --base-net) BASE_NET="${2:?}"; shift 2 ;;
-      --ns-prefix) NS_PREFIX="${2:?}"; shift 2 ;;
-      --wg-prefix) WG_PREFIX="${2:?}"; shift 2 ;;
+      --count) COUNT="${2:?}"; count_set=1; auto_ok=0; shift 2 ;;
+      --base-port) BASE_PORT="${2:?}"; auto_ok=0; shift 2 ;;
+      --base-net) BASE_NET="${2:?}"; auto_ok=0; shift 2 ;;
+      --ns-prefix) NS_PREFIX="${2:?}"; auto_ok=0; shift 2 ;;
+      --wg-prefix) WG_PREFIX="${2:?}"; auto_ok=0; shift 2 ;;
       --mode) MODE="${2:?}"; mode_set=1; shift 2 ;;
-      --egress-ips) EGRESS_IPS="${2:?}"; EGRESS_IPS="${EGRESS_IPS//[[:space:]]/}"; egress_ips_set=1; shift 2 ;;
+      --egress-ips) EGRESS_IPS="${2:?}"; EGRESS_IPS="${EGRESS_IPS//[[:space:]]/}"; egress_ips_set=1; auto_ok=0; shift 2 ;;
       --snat) MODE="snat"; mode_set=1; shift 1 ;;
       --uplink-if) UPLINK_IF="${2:?}"; shift 2 ;;
-      --wgcf-version) WGCF_VERSION="${2:?}"; shift 2 ;;
-      --gost-version) GOST_VERSION="${2:?}"; shift 2 ;;
-      --register-delay) REGISTER_DELAY="${2:?}"; shift 2 ;;
-      --register-retries) REGISTER_RETRIES="${2:?}"; shift 2 ;;
-      --register-backoff-base) REGISTER_BACKOFF_BASE="${2:?}"; shift 2 ;;
-      --register-backoff-max) REGISTER_BACKOFF_MAX="${2:?}"; shift 2 ;;
+      --wgcf-version) WGCF_VERSION="${2:?}"; auto_ok=0; shift 2 ;;
+      --gost-version) GOST_VERSION="${2:?}"; auto_ok=0; shift 2 ;;
+      --register-delay) REGISTER_DELAY="${2:?}"; auto_ok=0; shift 2 ;;
+      --register-retries) REGISTER_RETRIES="${2:?}"; auto_ok=0; shift 2 ;;
+      --register-backoff-base) REGISTER_BACKOFF_BASE="${2:?}"; auto_ok=0; shift 2 ;;
+      --register-backoff-max) REGISTER_BACKOFF_MAX="${2:?}"; auto_ok=0; shift 2 ;;
       -h|--help) usage_install; exit 0 ;;
       *) die "Unknown flag: $1" ;;
     esac
@@ -531,7 +531,7 @@ cmd_install() {
   # Auto-mode (no flags):
   # If server has >= 2 public IPv4s on the uplink, auto-set COUNT to that number.
   # Also set EGRESS_IPS so each namespace can be SNATed to a different source IPv4.
-  if [[ "$install_argc" -eq 0 && "$count_set" -eq 0 ]]; then
+  if [[ "$auto_ok" -eq 1 && "$count_set" -eq 0 && "$egress_ips_set" -eq 0 ]]; then
     local auto_ips auto_count
     auto_ips="$(detect_egress_ips_csv "$UPLINK_IF")"
     auto_count=0
@@ -542,9 +542,7 @@ cmd_install() {
     fi
     if [[ "$auto_count" -ge 2 ]]; then
       COUNT="$auto_count"
-      if [[ "$egress_ips_set" -eq 0 ]]; then
-        EGRESS_IPS="$auto_ips"
-      fi
+      EGRESS_IPS="$auto_ips"
       log "Detected ${auto_count} public IPv4 addresses on ${UPLINK_IF}; auto-setting COUNT=${auto_count} (one namespace per IPv4)."
     fi
   fi
