@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
-# warp-multi - Multiple egresses for X-UI / Xray load-balancing
-# Works by creating N network namespaces, each with its own egress and a SOCKS5 proxy.
-# Modes:
-#   - warp: Cloudflare WARP via WireGuard (wgcf) inside each netns
-#   - snat: Egress via server public IPv4s (SNAT per netns subnet)
+# warp-multi - Multi Cloudflare WARP egresses (WireGuard) for X-UI / Xray load-balancing
+# Works by creating N network namespaces, each with its own WARP WireGuard tunnel and a SOCKS5 proxy.
 #
 # Ubuntu/Debian (systemd) only.
 #
 # License: MIT
 set -euo pipefail
 
-VERSION="0.2.6"
+VERSION="0.1.0"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -26,8 +23,6 @@ BASE_PORT_DEFAULT=40000
 BASE_NET_DEFAULT="10.250" # uses ${BASE_NET}.${i}.0/24
 NS_PREFIX_DEFAULT="warp"
 WG_PREFIX_DEFAULT="warp"
-MODE_DEFAULT="warp" # warp|snat
-EGRESS_IPS_DEFAULT="" # for MODE=snat: comma-separated public IPv4 list (e.g. 1.2.3.4,5.6.7.8)
 
 WGCF_VERSION_DEFAULT="2.2.22"
 GOST_VERSION_DEFAULT="2.11.5"
@@ -37,18 +32,6 @@ REGISTER_DELAY_DEFAULT=8          # seconds to wait between successful registrat
 REGISTER_RETRIES_DEFAULT=8        # retries when 429 happens
 REGISTER_BACKOFF_BASE_DEFAULT=15  # exponential backoff base seconds (15,30,60,120,...)
 REGISTER_BACKOFF_MAX_DEFAULT=900  # max backoff seconds
-
-# exit IP probing (warp-multi ips/status)
-EXIT_IP_RETRIES_DEFAULT=3
-EXIT_IP_DELAY_DEFAULT=1
-EXIT_IP_MAX_TIME_DEFAULT=6
-EXIT_IP_URL_DEFAULT="https://cloudflare.com/cdn-cgi/trace"
-
-# WARP WireGuard reachability helpers
-WARP_ENDPOINT_HOST_DEFAULT="engage.cloudflareclient.com"
-WARP_ENDPOINT_PORTS_DEFAULT="2408,500,1701,4500"
-WARP_HANDSHAKE_WAIT_DEFAULT=12   # seconds to wait for initial handshake
-WARP_HANDSHAKE_TRY_WAIT_DEFAULT=6 # seconds to wait after changing endpoint/port
 
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
@@ -60,112 +43,13 @@ require_root() {
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-is_ipv4() {
-  local ip="${1:-}"
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  local o1 o2 o3 o4
-  IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
-  for o in "$o1" "$o2" "$o3" "$o4"; do
-    [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
-  done
-  return 0
-}
-
-is_public_ipv4() {
-  local ip="${1:-}"
-  is_ipv4 "$ip" || return 1
-
-  local o1 o2 o3 o4
-  IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
-
-  # RFC1918
-  if [[ "$o1" -eq 10 ]]; then return 1; fi
-  if [[ "$o1" -eq 172 && "$o2" -ge 16 && "$o2" -le 31 ]]; then return 1; fi
-  if [[ "$o1" -eq 192 && "$o2" -eq 168 ]]; then return 1; fi
-
-  # Loopback / link-local / CGNAT / multicast+reserved
-  if [[ "$o1" -eq 127 ]]; then return 1; fi
-  if [[ "$o1" -eq 169 && "$o2" -eq 254 ]]; then return 1; fi
-  if [[ "$o1" -eq 100 && "$o2" -ge 64 && "$o2" -le 127 ]]; then return 1; fi
-  if [[ "$o1" -eq 0 || "$o1" -ge 224 ]]; then return 1; fi
-
-  return 0
-}
-
-normalize_base_net() {
-  # Accept A.B, A.B.C, A.B.C.D, and CIDR forms; return A.B or empty.
-  local v="${1:-}"
-  v="${v//[[:space:]]/}"
-  v="${v%%/*}"
-  if [[ "$v" =~ ^([0-9]{1,3})\.([0-9]{1,3})(\.[0-9]{1,3}){0,2}$ ]]; then
-    echo "${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-    return 0
-  fi
-  echo ""
-  return 0
-}
-
-detect_egress_ips_csv() {
-  local dev="${1:?}"
-  local -a ips=()
-  local ip
-
-  while IFS= read -r ip; do
-    [[ -n "$ip" ]] || continue
-    is_public_ipv4 "$ip" || continue
-    ips+=("$ip")
-  done < <(ip -o -4 addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-
-  if [[ "${#ips[@]}" -eq 0 ]]; then
-    echo ""
-    return 0
-  fi
-
-  printf '%s\n' "${ips[@]}" \
-    | awk '!seen[$0]++' \
-    | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n \
-    | paste -sd, -
-}
-
-egress_ips_count() {
-  local ips="${EGRESS_IPS:-}"
-  [[ -n "$ips" ]] || { echo 0; return 0; }
-  local -a arr
-  IFS=',' read -r -a arr <<<"$ips"
-  echo "${#arr[@]}"
-}
-
-egress_ip_for_index() {
-  local i="${1:?}"
-  local ips="${EGRESS_IPS:-}"
-  [[ -n "$ips" ]] || { echo ""; return 0; }
-  local -a arr
-  IFS=',' read -r -a arr <<<"$ips"
-  local idx=$((i - 1))
-  if [[ "$idx" -lt 0 || "$idx" -ge "${#arr[@]}" ]]; then
-    echo ""
-    return 0
-  fi
-  echo "${arr[$idx]}"
-}
-
 ensure_defaults() {
   COUNT="${COUNT:-$COUNT_DEFAULT}"
   BASE_PORT="${BASE_PORT:-$BASE_PORT_DEFAULT}"
   BASE_NET="${BASE_NET:-$BASE_NET_DEFAULT}"
   NS_PREFIX="${NS_PREFIX:-$NS_PREFIX_DEFAULT}"
   WG_PREFIX="${WG_PREFIX:-$WG_PREFIX_DEFAULT}"
-  MODE="${MODE:-$MODE_DEFAULT}"
-  EGRESS_IPS="${EGRESS_IPS:-$EGRESS_IPS_DEFAULT}"
-  COUNT="${COUNT//[[:space:]]/}"
-  BASE_PORT="${BASE_PORT//[[:space:]]/}"
-  BASE_NET="${BASE_NET//[[:space:]]/}"
-  NS_PREFIX="${NS_PREFIX//[[:space:]]/}"
-  WG_PREFIX="${WG_PREFIX//[[:space:]]/}"
-  MODE="${MODE//[[:space:]]/}"
-  EGRESS_IPS="${EGRESS_IPS//[[:space:]]/}"
   UPLINK_IF="${UPLINK_IF:-}"
-  UPLINK_IF="${UPLINK_IF//[[:space:]]/}"
 
   WGCF_VERSION="${WGCF_VERSION:-$WGCF_VERSION_DEFAULT}"
   GOST_VERSION="${GOST_VERSION:-$GOST_VERSION_DEFAULT}"
@@ -174,11 +58,6 @@ ensure_defaults() {
   REGISTER_RETRIES="${REGISTER_RETRIES:-$REGISTER_RETRIES_DEFAULT}"
   REGISTER_BACKOFF_BASE="${REGISTER_BACKOFF_BASE:-$REGISTER_BACKOFF_BASE_DEFAULT}"
   REGISTER_BACKOFF_MAX="${REGISTER_BACKOFF_MAX:-$REGISTER_BACKOFF_MAX_DEFAULT}"
-
-  WARP_ENDPOINT_HOST="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
-  WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
-  WARP_HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
-  WARP_HANDSHAKE_TRY_WAIT="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
 }
 
 load_config() {
@@ -197,8 +76,6 @@ BASE_PORT=${BASE_PORT}
 BASE_NET=${BASE_NET}
 NS_PREFIX=${NS_PREFIX}
 WG_PREFIX=${WG_PREFIX}
-MODE=${MODE}
-EGRESS_IPS=${EGRESS_IPS}
 UPLINK_IF=${UPLINK_IF}
 WGCF_VERSION=${WGCF_VERSION}
 GOST_VERSION=${GOST_VERSION}
@@ -206,10 +83,6 @@ REGISTER_DELAY=${REGISTER_DELAY}
 REGISTER_RETRIES=${REGISTER_RETRIES}
 REGISTER_BACKOFF_BASE=${REGISTER_BACKOFF_BASE}
 REGISTER_BACKOFF_MAX=${REGISTER_BACKOFF_MAX}
-WARP_ENDPOINT_HOST=${WARP_ENDPOINT_HOST}
-WARP_ENDPOINT_PORTS=${WARP_ENDPOINT_PORTS}
-WARP_HANDSHAKE_WAIT=${WARP_HANDSHAKE_WAIT}
-WARP_HANDSHAKE_TRY_WAIT=${WARP_HANDSHAKE_TRY_WAIT}
 EOFCONF
 }
 
@@ -253,19 +126,8 @@ arch_suffix() {
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  local -a pkgs=(
-    ca-certificates
-    curl
-    gzip
-    jq
-    iproute2
-    iptables
-  )
-  if [[ "${MODE:-$MODE_DEFAULT}" == "warp" ]]; then
-    pkgs+=(wireguard-tools)
-  fi
   apt-get install -y --no-install-recommends \
-    "${pkgs[@]}"
+    ca-certificates curl jq iproute2 iptables wireguard-tools
 }
 
 install_wgcf() {
@@ -352,385 +214,6 @@ ipt() {
   iptables -w 5 "$@"
 }
 
-ipt_ensure_top() {
-  local table="${1:?}"
-  local chain="${2:?}"
-  shift 2
-
-  # Remove any duplicates then insert at the top, so we win over generic firewall/NAT rules.
-  while ipt -t "$table" -C "$chain" "$@" 2>/dev/null; do
-    ipt -t "$table" -D "$chain" "$@" 2>/dev/null || break
-  done
-  ipt -t "$table" -I "$chain" 1 "$@"
-}
-
-strip_wgconf_ipv6() {
-  local conf="${1:?}"
-  local tmp
-  tmp="$(mktemp)"
-
-  if ! awk '
-    BEGIN { in_iface=0; in_peer=0; kept_addr=0; kept_allowed=0 }
-    /^\[Interface\]$/ { in_iface=1; in_peer=0; print; next }
-    /^\[Peer\]$/      { in_peer=1; in_iface=0; print; next }
-
-    # Keep only IPv4 Address entries (supports comma-separated or repeated Address lines).
-    in_iface && /^Address[[:space:]]*=/ {
-      val=$0
-      sub(/^Address[[:space:]]*=[[:space:]]*/, "", val)
-      n=split(val, a, /,[[:space:]]*/)
-      out=""
-      for (i=1;i<=n;i++) {
-        if (a[i] ~ /^[0-9.]+\/[0-9]+$/) {
-          out = (out=="" ? a[i] : out", "a[i])
-        }
-      }
-      if (out != "") { print "Address = " out; kept_addr=1; next }
-      next
-    }
-
-    # Keep only IPv4 AllowedIPs entries (supports comma-separated or repeated AllowedIPs lines).
-    in_peer && /^AllowedIPs[[:space:]]*=/ {
-      val=$0
-      sub(/^AllowedIPs[[:space:]]*=[[:space:]]*/, "", val)
-      n=split(val, a, /,[[:space:]]*/)
-      out=""
-      for (i=1;i<=n;i++) {
-        if (a[i] ~ /^[0-9.]+\/[0-9]+$/) {
-          out = (out=="" ? a[i] : out", "a[i])
-        }
-      }
-      if (out != "") { print "AllowedIPs = " out; kept_allowed=1; next }
-      next
-    }
-
-    { print }
-
-    END {
-      if (kept_addr==0 || kept_allowed==0) exit 2
-    }
-  ' "$conf" >"$tmp"; then
-    rm -f "$tmp"
-    return 1
-  fi
-
-  cat "$tmp" >"$conf"
-  rm -f "$tmp"
-}
-
-resolve_endpoint_ipv4s() {
-  local host="${1:-}"
-  [[ -n "$host" ]] || return 1
-
-  if has_cmd getent; then
-    getent ahostsv4 "$host" 2>/dev/null \
-      | awk '{print $1}' \
-      | awk '!seen[$0]++' \
-      | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n
-    return 0
-  fi
-
-  return 1
-}
-
-pick_endpoint_ipv4_for_index() {
-  local i="${1:?}"
-  local host="${2:?}"
-
-  local -a ips=()
-  local ip
-  while IFS= read -r ip; do
-    [[ -n "$ip" ]] || continue
-    ips+=("$ip")
-  done < <(resolve_endpoint_ipv4s "$host" || true)
-
-  if [[ "${#ips[@]}" -eq 0 ]]; then
-    echo ""
-    return 1
-  fi
-
-  local idx=$(( (i - 1) % ${#ips[@]} ))
-  echo "${ips[$idx]}"
-  return 0
-}
-
-ensure_wgconf_endpoint_ipv4() {
-  local conf="${1:?}"
-  local i="${2:?}"
-
-  local ep raw host port
-  ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
-  [[ -n "$ep" ]] || return 0
-
-  host="${ep%:*}"
-  port="${ep##*:}"
-  if [[ "$ep" =~ ^\\[[0-9a-fA-F:]+\\]:[0-9]+$ ]]; then
-    host="" # IPv6 endpoint (disabled); force IPv4 below
-    port="${ep##*:}"
-  fi
-  [[ "$port" =~ ^[0-9]+$ ]] || port="2408"
-
-  # Already pinned to IPv4 literal
-  if is_ipv4 "$host"; then
-    return 0
-  fi
-
-  # Resolve IPv4 for the current hostname (or the default WARP hostname).
-  if [[ -z "$host" ]]; then
-    host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
-  fi
-
-  raw="$(pick_endpoint_ipv4_for_index "$i" "$host" || true)"
-  if [[ -z "$raw" ]]; then
-    warn "Could not resolve any IPv4 for Endpoint host '$host' in $conf; leaving as-is."
-    return 0
-  fi
-
-  sed -i -E "s|^Endpoint[[:space:]]*=.*|Endpoint = ${raw}:${port}|" "$conf" || true
-}
-
-wgconf_peer_pubkey() {
-  local conf="${1:?}"
-  awk -F= '
-    BEGIN { in_peer=0 }
-    /^\[Peer\]$/ { in_peer=1; next }
-    /^\[.*\]$/   { in_peer=0 }
-    in_peer && /^PublicKey[[:space:]]*=/ {
-      val=$0
-      sub(/^PublicKey[[:space:]]*=[[:space:]]*/, "", val)
-      gsub(/[[:space:]]/, "", val)
-      print val
-      exit
-    }
-  ' "$conf" 2>/dev/null || true
-}
-
-wg_latest_handshake_ts() {
-  local ns="${1:?}"
-  local iface="${2:?}"
-  local out ts
-  out="$(ip netns exec "$ns" wg show "$iface" latest-handshakes 2>/dev/null || true)"
-  ts="$(awk '{print $2; exit}' <<<"$out" 2>/dev/null || true)"
-  [[ -n "${ts:-}" ]] || { echo 0; return 1; }
-  echo "$ts"
-  return 0
-}
-
-wg_wait_handshake() {
-  local ns="${1:?}"
-  local iface="${2:?}"
-  local timeout_s="${3:-10}"
-
-  [[ "$timeout_s" =~ ^[0-9]+$ ]] || timeout_s=10
-  local end now ts
-  end=$(( $(date +%s) + timeout_s ))
-
-  while true; do
-    ts="$(wg_latest_handshake_ts "$ns" "$iface" 2>/dev/null || echo 0)"
-    if [[ "${ts:-0}" -gt 0 ]]; then
-      return 0
-    fi
-    now="$(date +%s)"
-    [[ "$now" -lt "$end" ]] || break
-    sleep 1
-  done
-  return 1
-}
-
-set_wgconf_endpoint() {
-  local conf="${1:?}"
-  local ip="${2:?}"
-  local port="${3:?}"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-
-  if grep -q '^Endpoint[[:space:]]*=' "$conf" 2>/dev/null; then
-    sed -i -E "s|^Endpoint[[:space:]]*=.*|Endpoint = ${ip}:${port}|" "$conf" || true
-    return 0
-  fi
-
-  # Insert under [Peer] if Endpoint line is missing.
-  sed -i "/^\\[Peer\\]$/a Endpoint = ${ip}:${port}" "$conf" || true
-  return 0
-}
-
-warp_try_fix_handshake() {
-  local i="${1:?}"
-  local ns="${2:?}"
-  local conf="${3:?}"
-
-  local iface peer cur_ep cur_host cur_port
-  iface="${WG_PREFIX}${i}"
-  peer="$(wgconf_peer_pubkey "$conf")"
-  [[ -n "${peer:-}" ]] || return 1
-
-  # First, wait a bit for initial handshake (especially right after boot).
-  # Trigger traffic so wg initiates handshake immediately (otherwise it may wait for keepalive).
-  ip netns exec "$ns" curl -4 -fsS --max-time 2 "${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}" >/dev/null 2>&1 || true
-  if wg_wait_handshake "$ns" "$iface" "${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"; then
-    return 0
-  fi
-
-  cur_ep="$(awk -F= '/^Endpoint[[:space:]]*=/ {print $2; exit}' "$conf" 2>/dev/null | tr -d '[:space:]' || true)"
-  cur_host="${cur_ep%:*}"
-  cur_port="${cur_ep##*:}"
-  [[ "$cur_port" =~ ^[0-9]+$ ]] || cur_port="2408"
-
-  local host="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
-
-  local -a ips=()
-  local ip preferred
-  if is_ipv4 "$cur_host"; then
-    ips+=("$cur_host")
-  fi
-  preferred="$(pick_endpoint_ipv4_for_index "$i" "$host" 2>/dev/null || true)"
-  [[ -n "${preferred:-}" ]] && ips+=("$preferred")
-  while IFS= read -r ip; do
-    [[ -n "$ip" ]] || continue
-    ips+=("$ip")
-  done < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
-
-  # Dedupe IPs
-  if [[ "${#ips[@]}" -gt 0 ]]; then
-    mapfile -t ips < <(printf '%s\n' "${ips[@]}" | awk 'NF && !seen[$0]++')
-  fi
-
-  local ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
-  ports_csv="${ports_csv//[[:space:]]/}"
-  local -a ports=()
-  local -a ports_raw=()
-  local p
-  IFS=',' read -r -a ports_raw <<<"$ports_csv"
-  ports_raw+=("$cur_port")
-  mapfile -t ports < <(printf '%s\n' "${ports_raw[@]}" \
-    | awk 'NF && $0 ~ /^[0-9]+$/ && $0 >= 1 && $0 <= 65535 && !seen[$0]++')
-
-  [[ "${#ips[@]}" -gt 0 ]] || return 1
-  [[ "${#ports[@]}" -gt 0 ]] || return 1
-
-  local try_wait="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
-  [[ "$try_wait" =~ ^[0-9]+$ ]] || try_wait="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
-
-  for p in "${ports[@]}"; do
-    for ip in "${ips[@]}"; do
-      [[ -n "$ip" ]] || continue
-      set_wgconf_endpoint "$conf" "$ip" "$p" || true
-      ip netns exec "$ns" wg set "$iface" peer "$peer" endpoint "${ip}:${p}" 2>/dev/null || true
-      # Trigger traffic so wg tries immediately.
-      ip netns exec "$ns" curl -4 -fsS --max-time 2 "${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}" >/dev/null 2>&1 || true
-      if wg_wait_handshake "$ns" "$iface" "$try_wait"; then
-        log "warp$(printf '%02d' "$i") handshake OK via Endpoint=${ip}:${p}"
-        return 0
-      fi
-    done
-  done
-
-  warn "warp$(printf '%02d' "$i") has no handshake after trying endpoints/ports (host=${host}, ports=${ports_csv})."
-  return 1
-}
-
-reg_base_net() {
-  # pick a private /16 different from BASE_NET to avoid collisions
-  local base="${BASE_NET:-$BASE_NET_DEFAULT}"
-  local cand
-  for cand in 10.254 10.253 10.252 10.251 10.249; do
-    if [[ "$cand" != "$base" ]]; then
-      echo "$cand"
-      return 0
-    fi
-  done
-  echo "10.254"
-}
-
-reg_ns_name() { echo "wmreg$1"; }
-reg_veth_host() { echo "vethr$1"; }
-reg_veth_ns() { echo "veths$1"; }
-reg_subnet_cidr() {
-  local i="${1:?}"
-  local base
-  base="$(reg_base_net)"
-  echo "${base}.${i}.0/24"
-}
-reg_host_ip() {
-  local i="${1:?}"
-  local base
-  base="$(reg_base_net)"
-  echo "${base}.${i}.1"
-}
-reg_ns_ip() {
-  local i="${1:?}"
-  local base
-  base="$(reg_base_net)"
-  echo "${base}.${i}.2"
-}
-
-regns_up() {
-  local i="${1:?}"
-  local egress_ip="${2:-}"
-  [[ -n "${UPLINK_IF:-}" ]] || die "UPLINK_IF is not set; run: warp-multi install --uplink-if <iface>"
-  [[ -n "$egress_ip" ]] || die "regns_up requires an egress IPv4"
-
-  local ns vh vn sub hostip nsip
-  ns="$(reg_ns_name "$i")"
-  vh="$(reg_veth_host "$i")"
-  vn="$(reg_veth_ns "$i")"
-  sub="$(reg_subnet_cidr "$i")"
-  hostip="$(reg_host_ip "$i")"
-  nsip="$(reg_ns_ip "$i")"
-
-  ip netns del "$ns" 2>/dev/null || true
-  ip link del "$vh" 2>/dev/null || true
-
-  ip netns add "$ns"
-  ip link add "$vh" type veth peer name "$vn"
-  ip link set "$vn" netns "$ns"
-
-  ip addr add "${hostip}/24" dev "$vh"
-  ip link set "$vh" up
-
-  ip netns exec "$ns" ip addr add "${nsip}/24" dev "$vn"
-  ip netns exec "$ns" ip link set "$vn" up
-  ip netns exec "$ns" ip link set lo up
-
-  ip netns exec "$ns" sysctl -q -w \
-    net.ipv6.conf.all.disable_ipv6=1 \
-    net.ipv6.conf.default.disable_ipv6=1 \
-    net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
-
-  ip netns exec "$ns" ip route add default via "$hostip"
-
-  mkdir -p "/etc/netns/$ns"
-  cat >"/etc/netns/$ns/resolv.conf" <<'EOFRESREG'
-# generated by warp-multi (registration netns)
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-EOFRESREG
-
-  ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip"
-  ipt_ensure_top filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
-  ipt_ensure_top filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-}
-
-regns_down() {
-  local i="${1:?}"
-  local egress_ip="${2:-}"
-  local ns vh sub
-  ns="$(reg_ns_name "$i")"
-  vh="$(reg_veth_host "$i")"
-  sub="$(reg_subnet_cidr "$i")"
-
-  if [[ -n "${UPLINK_IF:-}" ]] && [[ -n "$egress_ip" ]]; then
-    ipt -t nat -D POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip" 2>/dev/null || true
-    ipt -D FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || true
-    ipt -D FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-  fi
-
-  rm -f "/etc/netns/${ns}/resolv.conf" 2>/dev/null || true
-  rmdir "/etc/netns/${ns}" 2>/dev/null || true
-
-  ip link del "$vh" 2>/dev/null || true
-  ip netns del "$ns" 2>/dev/null || true
-}
-
 gen_warp_conf() {
   local i="$1"
   local dir conf
@@ -744,37 +227,15 @@ gen_warp_conf() {
   fi
 
   log "Generating WARP config #$i ..."
-  local rc=0
-  set +e
   (
     set -euo pipefail
     cd "$dir"
     umask 077
     rm -f wgcf-account.toml wgcf-profile.conf
 
-    local reg_ns=""
-    local reg_egress_ip=""
-    reg_egress_ip="$(egress_ip_for_index "$i")"
-    if [[ -n "${reg_egress_ip:-}" ]]; then
-      # Ensure UPLINK_IF exists for SNAT during registration.
-      if [[ -z "${UPLINK_IF:-}" ]]; then
-        UPLINK_IF="$(detect_uplink)"
-      fi
-      if [[ -n "${UPLINK_IF:-}" ]]; then
-        reg_ns="$(reg_ns_name "$i")"
-        trap 'regns_down "'"$i"'" "'"$reg_egress_ip"'"' EXIT
-        regns_up "$i" "$reg_egress_ip"
-        echo "wgcf register/generate for warp${i} via source IPv4 ${reg_egress_ip} (netns ${reg_ns})" >&2
-      fi
-    fi
-
     attempt=1
     while true; do
-      if [[ -n "${reg_ns:-}" ]]; then
-        out="$(ip netns exec "$reg_ns" wgcf register --accept-tos 2>&1)" && break
-      else
-        out="$(wgcf register --accept-tos 2>&1)" && break
-      fi
+      out="$(wgcf register --accept-tos 2>&1)" && break
 
       if echo "$out" | grep -qE '429 Too Many Requests|401 Unauthorized|403 Forbidden'; then
         if [[ "$attempt" -ge "$REGISTER_RETRIES" ]]; then
@@ -795,15 +256,10 @@ gen_warp_conf() {
       exit 43
     done
 
-    if [[ -n "${reg_ns:-}" ]]; then
-      out="$(ip netns exec "$reg_ns" wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
-    else
-      out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
-    fi
+    out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
     cp wgcf-profile.conf "$conf"
   )
   rc=$?
-  set -e
   if [[ "$rc" -ne 0 ]]; then
     if [[ "$rc" -eq 42 ]]; then
       die "Cloudflare rejected registration (429/401/403) while creating WARP #$i. Wait 15-60 minutes and re-run: warp-multi install (it will resume), or increase --register-delay / --register-retries / --register-backoff-base."
@@ -813,12 +269,6 @@ gen_warp_conf() {
 
   # Avoid letting wg-quick manage DNS in host; we'll set netns resolv.conf instead.
   sed -i '/^DNS =/d' "$conf" || true
-
-  # IPv4-only (strip IPv6 Address/AllowedIPs so netns can keep IPv6 disabled).
-  strip_wgconf_ipv6 "$conf" || true
-
-  # Pin Endpoint to an IPv4 literal (prevents wg from picking an AAAA record while IPv6 is disabled).
-  ensure_wgconf_endpoint_ipv4 "$conf" "$i" || true
 
   # Keepalive helps on some VPS providers.
   if ! grep -q '^PersistentKeepalive' "$conf"; then
@@ -831,7 +281,7 @@ gen_warp_conf() {
 write_systemd_units() {
   cat >"$UNIT_NETNS" <<'EOFUNIT1'
 [Unit]
-Description=warp-multi netns %i
+Description=WARP netns %i
 After=network-online.target
 Wants=network-online.target
 
@@ -847,7 +297,7 @@ EOFUNIT1
 
   cat >"$UNIT_SOCKS" <<'EOFUNIT2'
 [Unit]
-Description=warp-multi SOCKS5 in netns %i
+Description=WARP SOCKS5 in netns %i
 After=warp-netns@%i.service
 Requires=warp-netns@%i.service
 
@@ -865,24 +315,20 @@ EOFUNIT2
 }
 
 cmd_install() {
+  require_root
+
   # start from defaults
   COUNT="$COUNT_DEFAULT"
   BASE_PORT="$BASE_PORT_DEFAULT"
   BASE_NET="$BASE_NET_DEFAULT"
   NS_PREFIX="$NS_PREFIX_DEFAULT"
   WG_PREFIX="$WG_PREFIX_DEFAULT"
-  MODE="$MODE_DEFAULT"
-  EGRESS_IPS="$EGRESS_IPS_DEFAULT"
   WGCF_VERSION="$WGCF_VERSION_DEFAULT"
   GOST_VERSION="$GOST_VERSION_DEFAULT"
   REGISTER_DELAY="$REGISTER_DELAY_DEFAULT"
   REGISTER_RETRIES="$REGISTER_RETRIES_DEFAULT"
   REGISTER_BACKOFF_BASE="$REGISTER_BACKOFF_BASE_DEFAULT"
   REGISTER_BACKOFF_MAX="$REGISTER_BACKOFF_MAX_DEFAULT"
-  WARP_ENDPOINT_HOST="$WARP_ENDPOINT_HOST_DEFAULT"
-  WARP_ENDPOINT_PORTS="$WARP_ENDPOINT_PORTS_DEFAULT"
-  WARP_HANDSHAKE_WAIT="$WARP_HANDSHAKE_WAIT_DEFAULT"
-  WARP_HANDSHAKE_TRY_WAIT="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
   UPLINK_IF=""
 
   local old_count=""
@@ -891,108 +337,25 @@ cmd_install() {
     old_count="${COUNT:-}"
   fi
 
-  local count_set=0
-  local mode_set=0
-  local egress_ips_set=0
-  local auto_ok=1
-
   # parse flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --count) COUNT="${2:?}"; count_set=1; auto_ok=0; shift 2 ;;
-      --base-port) BASE_PORT="${2:?}"; auto_ok=0; shift 2 ;;
-      --base-net) BASE_NET="${2:?}"; auto_ok=0; shift 2 ;;
-      --ns-prefix) NS_PREFIX="${2:?}"; auto_ok=0; shift 2 ;;
-      --wg-prefix) WG_PREFIX="${2:?}"; auto_ok=0; shift 2 ;;
-      --mode) MODE="${2:?}"; mode_set=1; shift 2 ;;
-      --egress-ips) EGRESS_IPS="${2:?}"; EGRESS_IPS="${EGRESS_IPS//[[:space:]]/}"; egress_ips_set=1; auto_ok=0; shift 2 ;;
-      --snat) MODE="snat"; mode_set=1; shift 1 ;;
+      --count) COUNT="${2:?}"; shift 2 ;;
+      --base-port) BASE_PORT="${2:?}"; shift 2 ;;
+      --base-net) BASE_NET="${2:?}"; shift 2 ;;
+      --ns-prefix) NS_PREFIX="${2:?}"; shift 2 ;;
+      --wg-prefix) WG_PREFIX="${2:?}"; shift 2 ;;
       --uplink-if) UPLINK_IF="${2:?}"; shift 2 ;;
-      --wgcf-version) WGCF_VERSION="${2:?}"; auto_ok=0; shift 2 ;;
-      --gost-version) GOST_VERSION="${2:?}"; auto_ok=0; shift 2 ;;
-      --register-delay) REGISTER_DELAY="${2:?}"; auto_ok=0; shift 2 ;;
-      --register-retries) REGISTER_RETRIES="${2:?}"; auto_ok=0; shift 2 ;;
-      --register-backoff-base) REGISTER_BACKOFF_BASE="${2:?}"; auto_ok=0; shift 2 ;;
-      --register-backoff-max) REGISTER_BACKOFF_MAX="${2:?}"; auto_ok=0; shift 2 ;;
+      --wgcf-version) WGCF_VERSION="${2:?}"; shift 2 ;;
+      --gost-version) GOST_VERSION="${2:?}"; shift 2 ;;
+      --register-delay) REGISTER_DELAY="${2:?}"; shift 2 ;;
+      --register-retries) REGISTER_RETRIES="${2:?}"; shift 2 ;;
+      --register-backoff-base) REGISTER_BACKOFF_BASE="${2:?}"; shift 2 ;;
+      --register-backoff-max) REGISTER_BACKOFF_MAX="${2:?}"; shift 2 ;;
       -h|--help) usage_install; exit 0 ;;
       *) die "Unknown flag: $1" ;;
     esac
   done
-
-  require_root
-
-  if [[ "$count_set" -eq 1 ]]; then
-    [[ "$COUNT" =~ ^[0-9]+$ ]] || die "--count must be a number"
-    [[ "$COUNT" -ge 1 ]] || die "--count must be >= 1"
-  fi
-
-  if [[ -z "${UPLINK_IF:-}" ]]; then
-    UPLINK_IF="$(detect_uplink)"
-  fi
-  [[ -n "${UPLINK_IF:-}" ]] || die "Could not detect uplink interface; set with --uplink-if <iface> (hint: ip -4 route show default)"
-  ip link show "$UPLINK_IF" >/dev/null 2>&1 || die "Uplink interface '$UPLINK_IF' not found. Pick the interface from: ip -4 route show default"
-
-  # If user provided --egress-ips without --mode, assume SNAT mode.
-  if [[ "$egress_ips_set" -eq 1 && "$mode_set" -eq 0 ]]; then
-    MODE="snat"
-  fi
-
-  # Auto-mode (no flags):
-  # If server has >= 2 public IPv4s on the uplink, auto-set COUNT to that number.
-  # Also set EGRESS_IPS so each namespace can be SNATed to a different source IPv4.
-  if [[ "$auto_ok" -eq 1 && "$count_set" -eq 0 && "$egress_ips_set" -eq 0 ]]; then
-    local auto_ips auto_count
-    auto_ips="$(detect_egress_ips_csv "$UPLINK_IF")"
-    auto_count=0
-    if [[ -n "$auto_ips" ]]; then
-      local -a auto_arr
-      IFS=',' read -r -a auto_arr <<<"$auto_ips"
-      auto_count="${#auto_arr[@]}"
-    fi
-  if [[ "$auto_count" -ge 2 ]]; then
-      COUNT="$auto_count"
-      EGRESS_IPS="$auto_ips"
-      log "Detected ${auto_count} public IPv4 addresses on ${UPLINK_IF}; auto-setting COUNT=${auto_count} (one namespace per IPv4)."
-      log "Auto-detected uplink IPv4s: ${EGRESS_IPS}"
-    fi
-  fi
-
-  [[ "$MODE" == "warp" || "$MODE" == "snat" ]] || die "--mode must be 'warp' or 'snat'"
-
-  if [[ "$MODE" == "snat" ]]; then
-    if [[ -z "${EGRESS_IPS:-}" ]]; then
-      EGRESS_IPS="$(detect_egress_ips_csv "$UPLINK_IF")"
-      [[ -n "${EGRESS_IPS:-}" ]] || die "MODE=snat could not auto-detect any public IPv4 on '$UPLINK_IF'. Provide them explicitly with: --egress-ips A.B.C.D,..."
-      log "Auto-detected egress IPv4s on ${UPLINK_IF}: ${EGRESS_IPS}"
-    fi
-  fi
-
-  if [[ -n "${EGRESS_IPS:-}" ]]; then
-    local -a ips_arr
-    IFS=',' read -r -a ips_arr <<<"$EGRESS_IPS"
-    local ip_count="${#ips_arr[@]}"
-    [[ "$ip_count" -ge 1 ]] || die "--egress-ips must include at least 1 IPv4"
-
-    if ! printf '%s\n' "${ips_arr[@]}" | awk 'seen[$0]++ {exit 1}'; then
-      die "--egress-ips contains duplicates; provide unique public IPv4s"
-    fi
-
-    local ip
-    for ip in "${ips_arr[@]}"; do
-      is_public_ipv4 "$ip" || die "Invalid public IPv4 in --egress-ips: '$ip'"
-      if ! ip -4 addr show dev "$UPLINK_IF" 2>/dev/null | grep -qw "$ip"; then
-        warn "Egress IP '$ip' is not configured on uplink interface '$UPLINK_IF' yet. SNAT may fail until you add it."
-      fi
-    done
-
-    if [[ "$count_set" -eq 0 ]]; then
-      COUNT="$ip_count"
-    elif [[ "$MODE" == "snat" && "$COUNT" -gt "$ip_count" ]]; then
-      die "--count ($COUNT) must be <= number of --egress-ips ($ip_count)"
-    elif [[ "$MODE" == "warp" && "$COUNT" -gt "$ip_count" ]]; then
-      warn "EGRESS_IPS has ${ip_count} IPs but COUNT=$COUNT; indices >${ip_count} will use MASQUERADE (shared source IPv4)."
-    fi
-  fi
 
   [[ "$COUNT" =~ ^[0-9]+$ ]] || die "--count must be a number"
   [[ "$COUNT" -ge 1 ]] || die "--count must be >= 1"
@@ -1000,20 +363,6 @@ cmd_install() {
 
   [[ "$BASE_PORT" =~ ^[0-9]+$ ]] || die "--base-port must be a number"
   [[ "$BASE_PORT" -ge 1024 ]] || warn "--base-port < 1024 needs extra care; continuing anyway."
-  local max_port=$((BASE_PORT + COUNT))
-  [[ "$max_port" -le 65535 ]] || die "--base-port + --count must be <= 65535 (got ${BASE_PORT}+${COUNT}=${max_port}). Choose a lower --base-port or a smaller --count."
-
-  BASE_NET="$(normalize_base_net "$BASE_NET")"
-  if [[ -z "${BASE_NET:-}" ]]; then
-    warn "Invalid --base-net value; falling back to default: ${BASE_NET_DEFAULT}"
-    BASE_NET="$BASE_NET_DEFAULT"
-  fi
-  [[ "$BASE_NET" =~ ^[0-9]{1,3}\.[0-9]{1,3}$ ]] || die "--base-net must look like A.B (example: 10.250)"
-  local base_a base_b
-  base_a="${BASE_NET%%.*}"
-  base_b="${BASE_NET##*.}"
-  [[ "$base_a" -ge 0 && "$base_a" -le 255 ]] || die "--base-net first octet out of range: ${base_a} (expected 0..255)"
-  [[ "$base_b" -ge 0 && "$base_b" -le 255 ]] || die "--base-net second octet out of range: ${base_b} (expected 0..255)"
 
   [[ "$REGISTER_DELAY" =~ ^[0-9]+$ ]] || die "--register-delay must be a number (seconds)"
   [[ "$REGISTER_RETRIES" =~ ^[0-9]+$ ]] || die "--register-retries must be a number"
@@ -1023,14 +372,18 @@ cmd_install() {
   [[ "$REGISTER_BACKOFF_MAX" =~ ^[0-9]+$ ]] || die "--register-backoff-max must be a number (seconds)"
   [[ "$REGISTER_BACKOFF_MAX" -ge 1 ]] || die "--register-backoff-max must be >= 1"
 
+  if [[ -z "${UPLINK_IF:-}" ]]; then
+    UPLINK_IF="$(detect_uplink)"
+  fi
+  [[ -n "${UPLINK_IF:-}" ]] || die "Could not detect uplink interface; set with --uplink-if <iface> (hint: ip -4 route show default)"
+  ip link show "$UPLINK_IF" >/dev/null 2>&1 || die "Uplink interface '$UPLINK_IF' not found. Pick the interface from: ip -4 route show default"
+
   if ! has_cmd apt-get; then
     die "Installer supports Ubuntu/Debian (apt) only."
   fi
 
   apt_install
-  if [[ "$MODE" == "warp" ]]; then
-    install_wgcf
-  fi
+  install_wgcf
   install_gost
   ensure_sysctl
 
@@ -1041,18 +394,11 @@ cmd_install() {
   mkdir -p "$STATE_DIR" "$WG_DIR"
   local i conf
   for i in $(seq 1 "$COUNT"); do
-    if [[ "$MODE" == "warp" ]]; then
-      conf="$(cfg_path "$i")"
-      if [[ ! -f "$conf" ]]; then
-        gen_warp_conf "$i"
-        if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
-          sleep "$REGISTER_DELAY"
-        fi
-      else
-        # If user upgrades from an older version, ensure existing configs are IPv4-only too.
-        strip_wgconf_ipv6 "$conf" || true
-        ensure_wgconf_endpoint_ipv4 "$conf" "$i" || true
-        chmod 600 "$conf" || true
+    conf="$(cfg_path "$i")"
+    if [[ ! -f "$conf" ]]; then
+      gen_warp_conf "$i"
+      if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
+        sleep "$REGISTER_DELAY"
       fi
     fi
     systemctl enable --now "warp-netns@${i}.service" "warp-socks@${i}.service"
@@ -1083,9 +429,7 @@ cmd_ns_up() {
   vh="$(veth_host "$i")"
   vn="$(veth_ns "$i")"
 
-  if [[ "$MODE" == "warp" ]]; then
-    [[ -f "$conf" ]] || die "Missing config: $conf (run: warp-multi install)"
-  fi
+  [[ -f "$conf" ]] || die "Missing config: $conf (run: warp-multi install)"
 
   ip netns del "$ns" 2>/dev/null || true
   ip link del "$vh" 2>/dev/null || true
@@ -1100,49 +444,24 @@ cmd_ns_up() {
   ip netns exec "$ns" ip addr add "${nsip}/24" dev "$vn"
   ip netns exec "$ns" ip link set "$vn" up
   ip netns exec "$ns" ip link set lo up
-
-  ip netns exec "$ns" sysctl -q -w \
-    net.ipv6.conf.all.disable_ipv6=1 \
-    net.ipv6.conf.default.disable_ipv6=1 \
-    net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
-
   ip netns exec "$ns" ip route add default via "$hostip"
 
   mkdir -p "/etc/netns/$ns"
-  if [[ ! -f "/etc/netns/$ns/resolv.conf" ]]; then
-    cat >"/etc/netns/$ns/resolv.conf" <<'EOFRES'
-# generated by warp-multi (edit this file to override DNS for this namespace)
+  cat >"/etc/netns/$ns/resolv.conf" <<EOFRES
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 EOFRES
-  fi
 
-  local egress_ip
-  egress_ip="$(egress_ip_for_index "$i")"
-  if [[ "$MODE" == "snat" ]]; then
-    [[ -n "$egress_ip" ]] || die "MODE=snat requires a matching EGRESS_IPS entry for index $i"
-  fi
-  if [[ -n "$egress_ip" ]]; then
-    ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip"
-  else
-    ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
-  fi
+  ipt -t nat -C POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE 2>/dev/null || \
+    ipt -t nat -A POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
 
-  ipt_ensure_top filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
-  ipt_ensure_top filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  ipt -C FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || \
+    ipt -A FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
 
-  if [[ "$MODE" == "warp" ]]; then
-    strip_wgconf_ipv6 "$conf" || true
-    ensure_wgconf_endpoint_ipv4 "$conf" "$i" || true
-    if ! ip netns exec "$ns" wg-quick up "$conf" >/dev/null; then
-      warn "wg-quick up failed for $conf in netns $ns; cleaning up..."
-      cmd_ns_down "$i" >/dev/null 2>&1 || true
-      die "Failed to bring up WireGuard for $ns ($conf)."
-    fi
+  ipt -C FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    ipt -A FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
-    # Best-effort: some networks block UDP/2408; try alternative ports/endpoints if no handshake.
-    warp_try_fix_handshake "$i" "$ns" "$conf" || true
-  fi
+  ip netns exec "$ns" wg-quick up "$conf" >/dev/null
 }
 
 cmd_ns_down() {
@@ -1156,18 +475,11 @@ cmd_ns_down() {
   sub="$(subnet_cidr "$i")"
   vh="$(veth_host "$i")"
 
-  if [[ "$MODE" == "warp" ]]; then
-    ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
-  fi
+  ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
 
-  local egress_ip
-  egress_ip="$(egress_ip_for_index "$i")"
-  if [[ -n "$egress_ip" ]]; then
-    ipt -t nat -D POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip" 2>/dev/null || true
-  fi
   ipt -t nat -D POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE 2>/dev/null || true
   ipt -D FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT 2>/dev/null || true
-  ipt -D FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+  ipt -D FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
 
   ip link del "$vh" 2>/dev/null || true
   ip netns del "$ns" 2>/dev/null || true
@@ -1199,24 +511,8 @@ get_exit_ip() {
   if ! netns_exists "$ns"; then
     return 20
   fi
-  local tries delay max_time url attempt out ip
-  tries="${EXIT_IP_RETRIES:-$EXIT_IP_RETRIES_DEFAULT}"
-  delay="${EXIT_IP_DELAY:-$EXIT_IP_DELAY_DEFAULT}"
-  max_time="${EXIT_IP_MAX_TIME:-$EXIT_IP_MAX_TIME_DEFAULT}"
-  url="${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}"
-
-  for attempt in $(seq 1 "$tries"); do
-    out="$(ip netns exec "$ns" curl -4 -fsS --max-time "$max_time" "$url" 2>/dev/null || true)"
-    ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out")"
-    if [[ -n "$ip" ]]; then
-      echo "$ip"
-      return 0
-    fi
-    if [[ "$attempt" -lt "$tries" ]] && [[ "$delay" -gt 0 ]]; then
-      sleep "$delay"
-    fi
-  done
-  return 1
+  ip netns exec "$ns" curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    | awk -F= '/^ip=/{print $2; exit}'
 }
 
 cmd_ip() {
@@ -1302,7 +598,6 @@ cmd_rotate() {
 
   local i="${1:?}"
   [[ "$i" =~ ^[0-9]+$ ]] || die "Usage: warp-multi rotate <index>"
-  [[ "$MODE" == "warp" ]] || die "rotate is only available in MODE=warp"
 
   systemctl stop "warp-socks@${i}.service" "warp-netns@${i}.service" 2>/dev/null || true
 
@@ -1323,9 +618,6 @@ cmd_rotate_all() {
   local i
   for i in $(seq 1 "$COUNT"); do
     cmd_rotate "$i"
-    if [[ "${REGISTER_DELAY:-0}" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
-      sleep "$REGISTER_DELAY"
-    fi
   done
 }
 
@@ -1333,45 +625,13 @@ cmd_status() {
   require_root
   load_config
 
-  local i active ip addr port egress
+  local i active ip addr port
   for i in $(seq 1 "$COUNT"); do
     active="$(systemctl is-active "warp-socks@${i}.service" 2>/dev/null || true)"
     addr="$(ns_ip "$i")"
     port="$(socks_port "$i")"
     ip="$(cmd_ip "$i" 2>/dev/null || true)"
-    egress="$(egress_ip_for_index "$i")"
-    printf "warp%02d  socks=%s:%s  service=%s  egress_ip=%s  exit_ip=%s\n" \
-      "$i" "$addr" "$port" "${active:-unknown}" "${egress:-auto}" "${ip:-N/A}"
-  done
-}
-
-cmd_check_egress() {
-  load_config
-
-  local dev="${UPLINK_IF:-}"
-  if [[ -z "$dev" ]]; then
-    dev="$(detect_uplink)"
-  fi
-  [[ -n "$dev" ]] || die "Could not detect uplink interface; set in ${CONFIG_FILE} or run: warp-multi install --uplink-if <iface>"
-
-  local ips="${EGRESS_IPS:-}"
-  if [[ -z "$ips" ]]; then
-    ips="$(detect_egress_ips_csv "$dev")"
-  fi
-  [[ -n "$ips" ]] || die "No public IPv4 addresses detected on '${dev}'"
-
-  local -a arr
-  IFS=',' read -r -a arr <<<"$ips"
-
-  local ip out seen
-  for ip in "${arr[@]}"; do
-    out="$(curl -4 --interface "$ip" -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)"
-    seen="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out")"
-    if [[ -n "$seen" ]]; then
-      printf "%s -> %s OK\n" "$ip" "$seen"
-    else
-      printf "%s -> FAIL\n" "$ip"
-    fi
+    printf "warp%02d  socks=%s:%s  service=%s  exit_ip=%s\n" "$i" "$addr" "$port" "${active:-unknown}" "${ip:-N/A}"
   done
 }
 
@@ -1383,13 +643,9 @@ cmd_uninstall() {
   local i
 
   for i in $(seq 1 "$count"); do
-    local ns
-    ns="$(ns_name "$i")"
     systemctl disable --now "warp-socks@${i}.service" "warp-netns@${i}.service" 2>/dev/null || true
     # best-effort cleanup
     cmd_ns_down "$i" 2>/dev/null || true
-    rm -f "/etc/netns/${ns}/resolv.conf" 2>/dev/null || true
-    rmdir "/etc/netns/${ns}" 2>/dev/null || true
     rm -f "$(cfg_path "$i")" 2>/dev/null || true
     rm -rf "$(state_path "$i")" 2>/dev/null || true
   done
@@ -1410,10 +666,7 @@ usage_install() {
 warp-multi install [options]
 
 Options:
-  --mode M           Egress mode: warp|snat (default: ${MODE_DEFAULT})
-  --egress-ips CSV   Public IPv4 list for per-namespace SNAT (used as egress IPs in MODE=snat)
-  --snat             Shorthand for: --mode snat
-  --count N          Number of outbounds (default: ${COUNT_DEFAULT})
+  --count N          Number of WARP outbounds (default: ${COUNT_DEFAULT})
   --base-port P      Base port for SOCKS5 (default: ${BASE_PORT_DEFAULT}; ports are P+1..P+N)
   --base-net A.B     Base /16 for veth subnets (default: ${BASE_NET_DEFAULT})
   --uplink-if IFACE  Uplink interface name (auto-detected if not set)
@@ -1427,15 +680,10 @@ Options:
   --register-backoff-max S   Max backoff seconds (default: ${REGISTER_BACKOFF_MAX_DEFAULT})
 
 Examples:
-  warp-multi install --mode warp --count 10
-  warp-multi install --mode warp --count 10 --register-delay 12
-  warp-multi install --mode snat --egress-ips 203.0.113.10,203.0.113.11,203.0.113.12,203.0.113.13
+  warp-multi install
+  warp-multi install --count 10 --base-port 40000 --base-net 10.250
   warp-multi install --uplink-if ens3
-
-Notes:
-  If you run: warp-multi install
-  (no flags) and your server has >= 2 public IPv4 addresses on the uplink interface,
-  it will auto-set COUNT to that number and SNAT each namespace to a different uplink IPv4.
+  warp-multi install --count 10 --register-delay 12
 EOFU
 }
 
@@ -1444,26 +692,25 @@ usage() {
 warp-multi v${VERSION}
 
 Commands:
-  install [flags]          Install deps, generate configs (warp mode), enable services
+  install [flags]          Install deps, generate configs, enable services
   up                       Start/enable all services (does not re-register)
   down                     Stop all services (keeps configs)
   proxies                  Print SOCKS5 endpoints (for x-ui/xray outbounds)
   ip <i>                   Show exit IP for one tunnel
   ips                      Show exit IPs for all tunnels
   status                   Show service status + exit IPs
-  check-egress             Test uplink public IPv4 connectivity (curl --interface)
   restart <i|all>          Restart one or all tunnels
-  rotate <i>               (warp) Regenerate wgcf account/config for one tunnel (changes keys; usually changes exit IP)
-  rotate-all               (warp) Rotate all tunnels
-  ns-up <i>                (internal) bring up netns
-  ns-down <i>              (internal) bring down netns
+  rotate <i>               Regenerate wgcf account/config for one tunnel (changes keys; usually changes exit IP)
+  rotate-all               Rotate all tunnels
+  ns-up <i>                (internal) bring up netns + wg
+  ns-down <i>              (internal) bring down netns + wg
   socks <i>                (internal) run SOCKS5 proxy inside netns
   uninstall                Stop services and remove installed files
 
 Config file:
   ${CONFIG_FILE}
 
-Tip (warp mode only, to change exit location/IP sometimes):
+Tip (to change exit location/IP sometimes):
   Edit Endpoint in /etc/wireguard/${WG_PREFIX}<i>.conf then:
     warp-multi restart <i>
 EOFU
@@ -1483,7 +730,6 @@ main() {
     ip) cmd_ip "$@" ;;
     ips) cmd_ips "$@" ;;
     status) cmd_status "$@" ;;
-    check-egress) cmd_check_egress "$@" ;;
     restart) cmd_restart "$@" ;;
     rotate) cmd_rotate "$@" ;;
     rotate-all) cmd_rotate_all "$@" ;;
@@ -1497,3 +743,4 @@ main() {
 }
 
 main "$@"
+

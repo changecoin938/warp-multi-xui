@@ -1,108 +1,283 @@
-# warp-multi-xui
+## warp-multi-xui
 
-چند خروجی **SOCKS5** برای **x-ui / Xray** جهت **Load-balance** ترافیک.
+**ساخت چندین خروجی Cloudflare WARP (WireGuard) روی Ubuntu** و ارائه‌ی **SOCKS5** برای استفاده در **x-ui / Xray** جهت **پخش (Load-balance)** ترافیک.
 
-هر خروجی داخل یک **Network Namespace** جدا ساخته می‌شود تا از بقیه مستقل باشد.
+این پروژه برای هر خروجی WARP یک **Network Namespace جدا** می‌سازد؛ بنابراین هر تونل کاملاً مستقل است و می‌توانید در Xray آن‌ها را به‌عنوان چند outbound تعریف کنید.
 
-## ویژگی‌ها
+### نکته خیلی مهم درباره “۱۰ IP متفاوت”
 
-- **خودکار**: تعداد IPv4های عمومی روی uplink را تشخیص می‌دهد و به همان تعداد Namespace/SOCKS می‌سازد.
-- **IPv4-only**: داخل هر Namespace، IPv6 غیرفعال است و کانفیگ WireGuard هم IPv4-only می‌شود.
-- **WARP جدا برای هر IPv4**: اگر چند IPv4 عمومی داشته باشید، `wgcf register/generate` برای هر خروجی از همان IPv4 انجام می‌شود (تا هر تونل واقعاً جدا باشد).
-- **رفع N/A (Handshake)**: اگر تونل WARP handshake ندهد، به‌صورت خودکار چند پورت/endpoint دیگر را امتحان می‌کند.
-- نکته مهم: **Cloudflare WARP تضمین IP خروجی یکتا نمی‌دهد**؛ ممکن است چند تونل هنوز IP خروجی یکسان داشته باشند.
+**WARP تضمین نمی‌کند روی یک سرور حتماً ۱۰ IP عمومی متفاوت بگیرید.** این اسکریپت ۱۰ تونل مستقل می‌سازد، ولی ممکن است بعضی تونل‌ها **IP خروجی یکسان** بدهند.  
+برای تغییر IP خروجی معمولاً `rotate` کمک می‌کند (در ادامه توضیح داده شده).
 
-## پیش‌نیازها
+---
 
-- Ubuntu/Debian با systemd (مثل 20.04/22.04/24.04)
-- دسترسی root
-- اینترنت خروجی
+### پیش‌نیازها
 
-## نصب سریع
+- **Ubuntu/Debian با systemd** (مثلاً Ubuntu 20.04/22.04/24.04)
+- دسترسی **root**
+- دسترسی اینترنت خروجی (برای دانلود `wgcf` و `gost` و اتصال WARP)
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) --uplink-if enp1s0
-```
+---
 
-اگر `--uplink-if` را ندهید، اسکریپت خودش از route پیش‌فرض تشخیص می‌دهد.
+### نصب سریع (پیشنهادی)
 
-دستور بالا به صورت پیش‌فرض:
+این دستور `warp-multi` را نصب می‌کند و **به‌صورت پیش‌فرض ۱۰ خروجی** می‌سازد.
 
-- تعداد IPv4های عمومی روی uplink را پیدا می‌کند و `COUNT` را همان عدد می‌گذارد (مثلاً ۵ IP → ۵ SOCKS)
-- برای هر خروجی یک Namespace + یک SOCKS می‌سازد
-- برای هر خروجی، WARP جداگانه می‌سازد و از همان IPv4 ثبت‌نام می‌کند
-
-اگر wgcf خطای `429` یا `401/403` داد، معمولاً با delay بیشتر بهتر می‌شود:
+**اگر سرور شما root-only است (sudo نداری / از قبل root هستی):**
 
 ```bash
-warp-multi install --register-delay 12 --register-retries 10
+bash <(curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh) --count 10
 ```
 
-## استفاده
+**اگر sudo داری و می‌خوای یک‌خطی اجرا کنی:**
 
-- لیست SOCKSها (برای ساخت outbound در x-ui):
+```bash
+curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/install.sh | sudo bash -s -- --count 10
+```
+
+اگر ریپو را fork کردی:
+
+```bash
+REPO="YOUR_USER/warp-multi-xui" bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/warp-multi-xui/main/install.sh) --count 10
+```
+
+یا نصب از طریق clone:
+
+```bash
+apt update && apt install -y git
+git clone https://github.com/changecoin938/warp-multi-xui.git
+cd warp-multi-xui
+bash install.sh --count 10
+```
+
+### تنظیمات قابل تغییر در نصب
+
+نمونه‌ها:
+
+```bash
+/usr/local/bin/warp-multi install --count 10 --base-port 40000 --base-net 10.250
+```
+
+اگر خطای `429 Too Many Requests` گرفتی (rate limit کلادفلر)، نصب را با delay بیشتر انجام بده:
+
+```bash
+warp-multi install --count 10 --register-delay 12 --register-retries 10
+```
+
+اگر auto-detect اینترفیس مشکل داشت (اسم اینترفیس ممکنه `eth0` نباشه مثل `ens3`/`enp1s0`):
+
+اینترفیس درست رو ببین:
+
+```bash
+ip -4 route show default
+```
+
+بعد همون رو بده به اسکریپت:
+
+```bash
+warp-multi install --uplink-if ens3
+```
+
+---
+
+### گرفتن لیست SOCKSها برای x-ui
 
 ```bash
 warp-multi proxies
 ```
 
-- نمایش IP خروجی هر خروجی (**فقط IPv4**):
+خروجی پیش‌فرض چیزی شبیه این است:
+
+- `warp01 -> 10.250.1.2:40001`
+- …
+- `warp10 -> 10.250.10.2:40010`
+
+### دیدن IP خروجی هر WARP
 
 ```bash
 warp-multi ips
 ```
 
-- وضعیت سرویس‌ها:
+یا فقط یکی:
 
 ```bash
-warp-multi status
+warp-multi ip 3
 ```
 
-## (اختیاری) خروجی‌های یکتا با IPهای خود سرور
-
-اگر «IP یکتا» می‌خواهید و WARP برای شما IP تکراری می‌دهد، تنها راه قطعی این است که از IPv4های خود سرور به صورت SNAT خروجی بگیرید (این خروجی‌ها **WARP نیستند**):
+### تست سریع یک خروجی
 
 ```bash
-warp-multi install --snat --uplink-if enp1s0
+curl -fsS --proxy socks5h://10.250.1.2:40001 https://cloudflare.com/cdn-cgi/trace | grep '^ip='
 ```
 
-## اتصال به x-ui / Xray
+---
 
-برای هر SOCKS یک outbound از نوع **SOCKS** بساز:
+### اتصال به x-ui / Xray (پخش ترافیک)
 
-- address/host: `10.250.X.2`
-- port: `4000X`
+#### ساخت Outboundها
 
-نمونه آماده:
+در `x-ui`، برای هر کدام از SOCKSها یک outbound از نوع **SOCKS** بساز:
+
+- **tag**: `warp01` تا `warp10`
+- **address/host**: `10.250.X.2`
+- **port**: `4000X`
+
+نکته: دقیق‌ترین لیست را از `warp-multi proxies` بردار.
+
+#### پخش (Balancer)
+
+اگر x-ui امکان Balancer دارد:
+
+- یک balancer با tag مثل `warp-balancer` بساز
+- selector را روی `warp01..warp10` بگذار
+- strategy را `random` (یا `roundRobin` اگر پنل شما دارد) بگذار
+- یک rule بساز که inbound موردنظر را به `warp-balancer` بفرستد
+
+اگر می‌خواهی JSON را مستقیم وارد کنی، نمونه آماده اینجاست:
 
 - `examples/xray-balancer.example.json`
 
-## عیب‌یابی سریع
+داخلش فقط `YOUR_INBOUND_TAG` را با inbound tag خودت عوض کن.
+
+---
+
+### کامندهای اصلی
+
+نمایش راهنما:
 
 ```bash
-systemctl status warp-netns@1 warp-socks@1 --no-pager
-journalctl -u warp-netns@1 -e --no-pager
-journalctl -u warp-socks@1 -e --no-pager
+warp-multi --help
 ```
 
-بررسی اینکه همه IPv4های uplink واقعاً خروجی دارند:
+کامندهای پرکاربرد:
+
+- **نصب/ساخت سرویس‌ها**:
 
 ```bash
-warp-multi check-egress
+warp-multi install --count 10
 ```
 
-اگر `warp-multi ips` گفت `MISSING_NETNS`:
+- **بالا آوردن سرویس‌ها (بدون ساخت اکانت جدید)**:
 
 ```bash
 warp-multi up
 ```
 
-## حذف کامل
+- **خاموش کردن سرویس‌ها (کانفیگ‌ها پاک نمی‌شوند)**:
+
+```bash
+warp-multi down
+```
+
+- **نمایش وضعیت سرویس‌ها + IP خروجی**:
+
+```bash
+warp-multi status
+```
+
+- **ری‌استارت کردن یک تونل یا همه**:
+
+```bash
+warp-multi restart 3
+warp-multi restart all
+```
+
+- **تعویض IP (روش پیشنهادی)**: ساخت اکانت/کانفیگ جدید برای همان شماره
+
+```bash
+warp-multi rotate 3
+```
+
+- **تعویض برای همه**:
+
+```bash
+warp-multi rotate-all
+```
+
+- **حذف کامل**:
 
 ```bash
 warp-multi uninstall
 ```
 
-## لایسنس
+---
+
+### تغییر IP خروجی WARP (روش‌ها)
+
+- **روش 1 — restart**: ممکن است IP عوض شود، ولی تضمینی نیست:
+
+```bash
+warp-multi restart 3
+```
+
+- **روش 2 — rotate (بهترین)**: کانفیگ جدید می‌سازد (معمولاً IP عوض می‌شود):
+
+```bash
+warp-multi rotate 3
+```
+
+- **روش 3 — تغییر Endpoint** (پیشرفته/اختیاری): داخل فایل زیر مقدار `Endpoint = ...` را تغییر بده و بعد restart کن:
+
+`/etc/wireguard/warp3.conf`
+
+و سپس:
+
+```bash
+warp-multi restart 3
+```
+
+---
+
+### عیب‌یابی
+
+- **دیدن وضعیت سرویس‌ها**:
+
+```bash
+systemctl status warp-netns@1 warp-socks@1 --no-pager
+```
+
+- **ارور `429 Too Many Requests` یا `401 Unauthorized` در wgcf**:
+  - این یعنی Cloudflare روی IP سرور شما برای Register کردن اکانت‌های WARP **rate limit / block موقت** گذاشته.
+  - **راه‌حل**: ۱۵ تا ۶۰ دقیقه صبر کن و دوباره همین دستور رو بزن؛ اسکریپت از جایی که مونده ادامه می‌ده:
+
+```bash
+warp-multi install --count 10
+```
+
+  - یا از اول با delay بیشتر اجرا کن:
+
+```bash
+warp-multi install --count 10 --register-delay 12 --register-retries 10
+```
+
+- **اگر `warp-multi ips` گفت `MISSING_NETNS`**:
+  - یعنی سرویس‌ها بالا نیستن/نصب کامل نشده.
+  - اول اینو بزن:
+
+```bash
+warp-multi up
+```
+
+  - اگر سرویس‌ها وجود ندارن یا باز هم حل نشد:
+
+```bash
+warp-multi install --count 10
+```
+
+- **لاگ‌ها**:
+
+```bash
+journalctl -u warp-netns@1 -e --no-pager
+journalctl -u warp-socks@1 -e --no-pager
+```
+
+- **اگر چند تا تونل IP یکسان دادن**:
+  - چند بار `rotate` بزن (گاهی لازم می‌شود)
+  - توجه کن که **تضمین ۱۰ IP متفاوت وجود ندارد**
+
+---
+
+### لایسنس
 
 MIT (فایل `LICENSE`).
+
