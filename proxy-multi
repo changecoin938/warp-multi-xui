@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# proxy-multi - turn a list of proxies into an Xray (x-ui) load-balancer.
+#
+# Interactively asks how many proxies you have, reads "host:port:user:pass" lines,
+# tests each one (auto-detects http/socks5, finds the real exit IP + geo, drops the
+# dead ones), then generates a ready Xray outbounds + balancer config for x-ui/Xray.
+#
+# Dependencies: curl only.
+# License: MIT
+set -euo pipefail
+
+VERSION="0.1.0"
+
+STATE_DIR="${STATE_DIR:-/etc/proxy-multi}"
+OUT_JSON="${OUT_JSON:-${STATE_DIR}/xray-outbounds.json}"
+
+GEO_URL="${GEO_URL:-https://ipinfo.io/json}"
+TRACE_URL="${TRACE_URL:-https://cloudflare.com/cdn-cgi/trace}"
+TEST_TIMEOUT="${TEST_TIMEOUT:-15}"
+
+BALANCER_TAG="${BALANCER_TAG:-proxy-balancer}"
+TAG_PREFIX="${TAG_PREFIX:-px}"
+BALANCER_STRATEGY="${BALANCER_STRATEGY:-random}"   # random | leastPing (leastPing needs observatory)
+
+log()  { echo "[$(date +'%F %T')] $*"; }
+warn() { echo "WARN: $*" >&2; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_tools() {
+  has_cmd curl || die "curl is required (apt-get install -y curl)."
+}
+
+# Minimal JSON string escaper (handles backslash and double-quote).
+json_escape() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# Extract a top-level string field from a (pretty-printed) JSON blob without jq.
+get_json_field() {
+  local json="$1" field="$2"
+  printf '%s' "$json" | grep -oE "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 \
+    | sed -E "s/.*:[[:space:]]*\"([^\"]*)\"/\1/"
+}
+
+# Parse one proxy line into P_HOST/P_PORT/P_USER/P_PASS/P_SCHEME.
+# Accepts:  host:port:user:pass   |   host:port   |   scheme://[user:pass@]host:port
+parse_proxy() {
+  local line="${1:-}"
+  line="${line//[[:space:]]/}"
+  P_HOST=""; P_PORT=""; P_USER=""; P_PASS=""; P_SCHEME=""
+  [[ -n "$line" ]] || return 1
+
+  if [[ "$line" == *"://"* ]]; then
+    P_SCHEME="${line%%://*}"
+    line="${line#*://}"
+    if [[ "$line" == *"@"* ]]; then
+      local creds="${line%@*}" hostport="${line##*@}"
+      P_USER="${creds%%:*}"; P_PASS="${creds#*:}"
+      P_HOST="${hostport%%:*}"; P_PORT="${hostport##*:}"
+    else
+      P_HOST="${line%%:*}"; P_PORT="${line##*:}"
+    fi
+  else
+    local -a f=()
+    IFS=':' read -r -a f <<<"$line"
+    case "${#f[@]}" in
+      2) P_HOST="${f[0]}"; P_PORT="${f[1]}" ;;
+      4) P_HOST="${f[0]}"; P_PORT="${f[1]}"; P_USER="${f[2]}"; P_PASS="${f[3]}" ;;
+      *) return 1 ;;
+    esac
+  fi
+
+  [[ -n "$P_HOST" && "$P_PORT" =~ ^[0-9]+$ ]] || return 1
+  return 0
+}
+
+# Test a proxy. On success sets T_PROTO (http|socks), T_IP, T_GEO, T_ORG and returns 0.
+# Auto-detects the protocol unless P_SCHEME forces one.
+test_proxy() {
+  local host="$1" port="$2" user="$3" pass="$4" want="${5:-}"
+  local auth="" s url out ip
+  [[ -n "$user" ]] && auth="${user}:${pass}@"
+
+  local -a schemes
+  case "$want" in
+    http)                 schemes=(http) ;;
+    socks|socks5|socks5h) schemes=(socks5h) ;;
+    *)                    schemes=(http socks5h) ;;
+  esac
+
+  T_PROTO=""; T_IP=""; T_GEO=""; T_ORG=""
+  for s in "${schemes[@]}"; do
+    url="${s}://${auth}${host}:${port}"
+    out="$(curl -s --max-time "$TEST_TIMEOUT" --proxy "$url" "$GEO_URL" 2>/dev/null || true)"
+    ip="$(get_json_field "$out" ip)"
+    if [[ -z "$ip" ]]; then
+      # Fallback: cloudflare trace (gives ip only, no geo).
+      out="$(curl -s --max-time "$TEST_TIMEOUT" --proxy "$url" "$TRACE_URL" 2>/dev/null || true)"
+      ip="$(printf '%s' "$out" | sed -n 's/^ip=//p' | head -1)"
+      if [[ -n "$ip" ]]; then
+        T_PROTO="$([[ "$s" == "http" ]] && echo http || echo socks)"
+        T_IP="$ip"
+        T_GEO="$(printf '%s' "$out" | sed -n 's/^loc=//p' | head -1)"
+        T_ORG=""
+        return 0
+      fi
+      continue
+    fi
+    T_PROTO="$([[ "$s" == "http" ]] && echo http || echo socks)"
+    T_IP="$ip"
+    local city region country
+    city="$(get_json_field "$out" city)"
+    region="$(get_json_field "$out" region)"
+    country="$(get_json_field "$out" country)"
+    T_GEO="$(printf '%s' "${city:+$city, }${region:+$region, }${country}" | sed 's/, *$//')"
+    T_ORG="$(get_json_field "$out" org)"
+    return 0
+  done
+  return 1
+}
+
+# Emit one Xray outbound object (indented) for a working proxy.
+gen_outbound() {
+  local tag="$1" proto="$2" host="$3" port="$4" user="$5" pass="$6"
+  local users=""
+  if [[ -n "$user" ]]; then
+    users=", \"users\": [{ \"user\": \"$(json_escape "$user")\", \"pass\": \"$(json_escape "$pass")\" }]"
+  fi
+  printf '    { "tag": "%s", "protocol": "%s", "settings": { "servers": [{ "address": "%s", "port": %s%s }] } }' \
+    "$(json_escape "$tag")" "$proto" "$(json_escape "$host")" "$port" "$users"
+}
+
+read_proxy_lines() {
+  # Populates the global INPUT_LINES array, either from --file or interactively.
+  INPUT_LINES=()
+  if [[ -n "${PROXY_FILE:-}" ]]; then
+    [[ -f "$PROXY_FILE" ]] || die "File not found: $PROXY_FILE"
+    mapfile -t INPUT_LINES < "$PROXY_FILE"
+    return 0
+  fi
+
+  local n
+  read -rp "How many proxies do you want to add? " n
+  [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -ge 1 ]] || die "Enter a number >= 1."
+  echo "Paste each proxy on its own line (host:port:user:pass)."
+  local i line
+  for i in $(seq 1 "$n"); do
+    read -rp "  proxy $i: " line
+    INPUT_LINES+=("$line")
+  done
+}
+
+cmd_setup() {
+  ensure_tools
+  mkdir -p "$STATE_DIR"
+
+  local -a INPUT_LINES=()
+  read_proxy_lines
+
+  local -a outbounds=() tags=()
+  local idx=0 line tag
+  printf '\n%-24s %-6s %-16s %-26s %s\n' "PROXY" "PROTO" "EXIT_IP" "GEO" "STATUS"
+  printf '%s\n' "--------------------------------------------------------------------------------"
+  for line in "${INPUT_LINES[@]}"; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    if ! parse_proxy "$line"; then
+      printf '%-24s %-6s %-16s %-26s %s\n' "$line" "-" "-" "-" "BAD-FORMAT"
+      continue
+    fi
+    idx=$((idx + 1))
+    tag="${TAG_PREFIX}$(printf '%02d' "$idx")"
+    if test_proxy "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS" "$P_SCHEME"; then
+      printf '%-24s %-6s %-16s %-26s %s\n' "${P_HOST}:${P_PORT}" "$T_PROTO" "$T_IP" "${T_GEO:-?}" "OK ($tag)"
+      outbounds+=("$(gen_outbound "$tag" "$T_PROTO" "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS")")
+      tags+=("$tag")
+    else
+      printf '%-24s %-6s %-16s %-26s %s\n' "${P_HOST}:${P_PORT}" "-" "-" "-" "DEAD/skip"
+    fi
+  done
+  echo
+
+  [[ "${#tags[@]}" -ge 1 ]] || die "No working proxy found; nothing to generate."
+
+  # Warn on duplicate exit IPs (no diversity benefit).
+  # (Best-effort: we only have IPs printed above; keeping it simple here.)
+
+  # Join outbound objects.
+  local obs_joined="" o first=1
+  for o in "${outbounds[@]}"; do
+    if [[ "$first" -eq 1 ]]; then obs_joined="$o"; first=0; else obs_joined="${obs_joined},"$'\n'"$o"; fi
+  done
+
+  # Build the selector tags array: "px01", "px02", ...
+  local tags_joined="" t
+  for t in "${tags[@]}"; do tags_joined="${tags_joined:+$tags_joined, }\"$(json_escape "$t")\""; done
+
+  cat > "$OUT_JSON" <<EOF
+{
+  "outbounds": [
+${obs_joined}
+  ],
+  "routing": {
+    "balancers": [
+      { "tag": "${BALANCER_TAG}", "selector": [${tags_joined}], "strategy": { "type": "${BALANCER_STRATEGY}" } }
+    ],
+    "rules": [
+      { "type": "field", "inboundTag": ["YOUR_INBOUND_TAG"], "balancerTag": "${BALANCER_TAG}" }
+    ]
+  }
+}
+EOF
+
+  log "Generated config for ${#tags[@]} working proxy(ies): $OUT_JSON"
+  echo "-------------------- Xray config --------------------"
+  cat "$OUT_JSON"
+  echo "-----------------------------------------------------"
+  echo
+  echo "Apply it in x-ui:"
+  echo "  Panel -> Xray Configuration -> merge these 'outbounds' and 'routing' sections,"
+  echo "  then replace YOUR_INBOUND_TAG with your real inbound tag and restart Xray."
+}
+
+usage() {
+  cat <<EOF
+proxy-multi v${VERSION} - build an Xray (x-ui) balancer from a proxy list
+
+Usage:
+  proxy-multi setup [--file proxies.txt]   Interactively (or from a file) test proxies
+                                           and generate the Xray balancer config.
+
+Proxy line formats:
+  host:port:user:pass
+  host:port
+  socks5://user:pass@host:port
+  http://user:pass@host:port
+
+Output config: ${OUT_JSON}
+Env knobs: BALANCER_TAG, TAG_PREFIX, BALANCER_STRATEGY (random|leastPing), TEST_TIMEOUT
+EOF
+}
+
+main() {
+  local cmd="${1:-setup}"
+  shift || true
+
+  PROXY_FILE=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file) PROXY_FILE="${2:?}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+
+  case "$cmd" in
+    setup) cmd_setup ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) die "Unknown command: $cmd (use: proxy-multi --help)" ;;
+  esac
+}
+
+main "$@"
