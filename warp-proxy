@@ -26,6 +26,7 @@ WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.193.1:2408}"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 ROTATE="${ROTATE:-5}"            # minutes; 0 = no rotation (balance instead)
 LOCALS_FILE="${STATE_DIR}/locals.list"
+PROXY_LIST="${PROXY_LIST:-${STATE_DIR}/proxies.list}"
 
 PROXY_FILE=""
 
@@ -115,14 +116,37 @@ warp_account_confs() { ls "$WG_DIR"/*.conf 2>/dev/null || true; }
 cmd_setup() {
   require_root; ensure_tools; mkdir -p "$STATE_DIR"
   read_proxies
+  build_and_wire
+}
 
-  # keep valid proxies
+# Append more proxies to the saved list (one WARP tunnel per proxy), then rebuild.
+cmd_add() {
+  require_root; ensure_tools; mkdir -p "$STATE_DIR"
+  PROXIES=()
+  [[ -f "$PROXY_LIST" ]] && mapfile -t PROXIES < "$PROXY_LIST"
+  local had="${#PROXIES[@]}"
+  if [[ -n "$PROXY_FILE" ]]; then
+    local l; while IFS= read -r l; do [[ -n "${l//[[:space:]]/}" ]] && PROXIES+=("$l"); done < "$PROXY_FILE"
+  else
+    log "Saved proxies: ${had}. New ones get appended."
+    local n; read -rp "How many MORE UDP-capable SOCKS5 proxies? " n
+    [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] || die "Enter a number >= 1."
+    echo "Paste each NEW proxy (host:port:user:pass) — UDP/SOCKS5 port:"
+    local i l; for i in $(seq 1 "$n"); do read -rp "  new proxy $i: " l; [[ -n "${l//[[:space:]]/}" ]] && PROXIES+=("$l"); done
+  fi
+  [[ "${#PROXIES[@]}" -gt "$had" ]] || die "No new proxies were added."
+  build_and_wire
+}
+
+build_and_wire() {
+  # keep valid proxies and persist the list (so `add` can extend it)
   local -a P=(); local l
   for l in "${PROXIES[@]}"; do
     [[ -n "${l//[[:space:]]/}" ]] || continue
     if parse_proxy "$l"; then P+=("$l"); else warn "skip bad proxy line: $l"; fi
   done
   [[ "${#P[@]}" -ge 1 ]] || die "No valid proxies."
+  printf '%s\n' "${P[@]}" > "$PROXY_LIST"
 
   # established WARP accounts
   local -a ACC=(); mapfile -t ACC < <(warp_account_confs)
@@ -251,6 +275,8 @@ Usage:
   warp-proxy setup [--file proxies.txt] [--rotate MIN]
         Build sing-box WARP-through-proxy tunnels (reusing warp-multi's WARP accounts),
         expose them as local SOCKS5, and wire them into x-ui via proxy-multi.
+  warp-proxy add [--file more.txt] [--rotate MIN]
+        Append more proxies (one WARP tunnel each) without re-entering the old ones.
   warp-proxy status      Show each tunnel's current WARP exit IP.
   warp-proxy down        Stop the sing-box service.
 
@@ -276,6 +302,7 @@ main() {
   [[ "$ROTATE" =~ ^[0-9]+$ ]] || die "--rotate must be a number."
   case "$cmd" in
     setup) cmd_setup ;;
+    add) cmd_add ;;
     status) cmd_status ;;
     down) cmd_down ;;
     -h|--help|help) usage; exit 0 ;;

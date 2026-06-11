@@ -103,6 +103,72 @@ warp-multi install --warp-plus-license <KEY>
 
 ---
 
+## استفاده از پروکسی‌های خودت (proxy-multi و warp-proxy)
+
+دو ابزار جدا برای وقتی که می‌خواهی از **پروکسی‌های خودت** برای خروجیِ x-ui استفاده کنی. هر دو خودکار به پنل **3x-ui** وصل می‌شوند (بکاپ + merge + ری‌استارت) و چرخش/balance دارند.
+
+### الف) `proxy-multi` — پروکسی‌ها را مستقیم استفاده کن
+
+هر پروکسی = یک IP خروجی متفاوت (IP خودِ پروکسی). تست می‌کند، مرده‌ها را می‌اندازد، و خودکار در x-ui می‌گذارد.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/proxy-multi -o /usr/local/bin/proxy-multi
+chmod +x /usr/local/bin/proxy-multi
+
+proxy-multi setup --rotate 5   # می‌پرسد چند پروکسی؛ تست و خودکار به x-ui وصل می‌کند (چرخش هر ۵ دقیقه)
+proxy-multi add                # افزودن پروکسی جدید، بدون شروع از صفر
+proxy-multi ips4               # IP خروجی هرکدام + علامت تکراری‌ها
+proxy-multi setup --no-rotate  # خاموش‌کردن چرخش (پخش تصادفی روی همه)
+```
+
+> فرمت هر پروکسی در یک خط: `host:port:user:pass` (یا `host:port`). خروجی = IP دیتاسنتریِ پروکسی؛ بعضی سایت‌ها ممکن است بلاکش کنند.
+
+### ب) `warp-proxy` — یک IP **تمیزِ وارپ** به‌ازای هر پروکسی ✅
+
+هر پروکسی را از WARP رد می‌کند، پس خروجی یک **IP تمیزِ Cloudflare نزدیک محلِ پروکسی** می‌شود (نه IP پروکسی). برای وقتی که IP تمیزِ بلاک‌نشدنی و متنوع می‌خواهی.
+
+**پیش‌نیاز:**
+- پروکسیِ **SOCKS5 با پشتیبانی UDP** (UDP ASSOCIATE) — چون WARP روی UDP است. پروکسی HTTP یا SOCKS5-بدون-UDP کار نمی‌کند.
+- اکانت‌های WARP جاافتاده در `/etc/wireguard/` (همان‌هایی که `warp-multi` می‌سازد)، حداقل به تعداد پروکسی‌ها.
+
+**نصب و راه‌اندازی (یک‌دستوری):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/warp-proxy -o /usr/local/bin/warp-proxy
+chmod +x /usr/local/bin/warp-proxy
+
+warp-proxy setup --rotate 5    # پروکسی‌های SOCKS5 (پورتِ UDP) را می‌پرسد، تونل WARP می‌سازد،
+                               # و خودکار با چرخش هر ۵ دقیقه به x-ui وصل می‌کند
+```
+
+**افزودن پروکسی جدید (بدون شروع از صفر):**
+```bash
+warp-proxy add                 # می‌پرسد چندتای جدید؛ به لیست می‌چسباند و دوباره می‌سازد
+```
+
+**دیدن IP وارپِ هر پروکسی / خاموش‌کردن:**
+```bash
+warp-proxy status              # 127.0.0.1:42001 -> 104.28.205.80  ...
+warp-proxy down                # توقف همهٔ تونل‌ها
+```
+
+**تست اینکه پروکسی UDP می‌دهد یا نه** (قبل از استفاده در warp-proxy):
+```bash
+# host:port:user:pass را با پروکسیِ SOCKS5 خودت عوض کن، روی سرور بزن
+PROXY="HOST:PORT:USER:PASS"; IFS=':' read -r H PT U P <<<"$PROXY"; cd /tmp
+[ -x ./gost ] || { curl -fsSL -o gost.gz https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz && gunzip -f gost.gz && chmod +x gost; }
+./gost -L "udp://127.0.0.1:5300/8.8.8.8:53" -F "socks5://$U:$P@$H:$PT" >/tmp/g.log 2>&1 &
+sleep 2; ./gost -L "udp://127.0.0.1:5301/stun.l.google.com:19302" -F "socks5://$U:$P@$H:$PT" >>/tmp/g.log 2>&1 &
+sleep 3; grep -q 'UDP tunnel failure' /tmp/g.log && echo "UDP: ❌ پشتیبانی نمی‌شود" || echo "UDP: ✅ احتمالاً اوکی"; pkill -f 'gost -L udp'
+```
+
+**نکته‌های مهم:**
+- تعداد IP وارپِ متفاوت ≈ تعداد **لوکیشن‌های متفاوتِ** پروکسی‌ها (پروکسی‌های یک شهر ممکن است IP یکسان/نزدیک بدهند).
+- موقع راه‌اندازی، تونل‌های `warp-multi` (netns) **stop** می‌شوند تا کلیدهای WARP آزاد شوند (sing-box ازشان استفاده می‌کند).
+- **پورت SOCKS5/UDP** پروکسی را بده، نه پورت HTTP.
+- معماری: `x-ui → SOCKS محلیِ sing-box → WARP(userspace) → پروکسی → IP تمیز وارپ`. sing-box خودکار نصب می‌شود.
+
+---
+
 ## دستورات
 
 | دستور | کار |
