@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# warp-proxy - chain Cloudflare WARP through UDP-capable SOCKS5 proxies, exposing a clean
+# WARP exit IP per proxy (from the proxy's colo) as local SOCKS5 for x-ui / Xray.
+#
+# Flow:  x-ui -> local sing-box SOCKS (127.0.0.1:BASE+i) -> WARP (userspace) -> detour ->
+#        your SOCKS5 proxy_i -> Cloudflare colo near proxy_i -> clean WARP IP.
+#
+# One sing-box instance hosts all tunnels (N inbounds + N wireguard endpoints + N socks
+# outbounds + N route rules). Established WARP accounts are reused from warp-multi.
+#
+# Requires: root, sing-box (auto-installed), jq, UDP-capable SOCKS5 proxies, and >= N
+# WARP accounts under /etc/wireguard (e.g. from warp-multi).
+# License: MIT
+set -euo pipefail
+
+VERSION="0.1.0"
+
+STATE_DIR="${STATE_DIR:-/etc/warp-proxy}"
+SB_BIN="${SB_BIN:-/usr/local/bin/sing-box}"
+SB_CONF="${SB_CONF:-${STATE_DIR}/config.json}"
+SB_SERVICE="${SB_SERVICE:-warp-proxy}"
+SB_VERSION="${SB_VERSION:-1.11.4}"
+BASE_PORT="${BASE_PORT:-42000}"
+WARP_PUBKEY="${WARP_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}"
+WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.193.1:2408}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+ROTATE="${ROTATE:-5}"            # minutes; 0 = no rotation (balance instead)
+LOCALS_FILE="${STATE_DIR}/locals.list"
+
+PROXY_FILE=""
+
+log()  { echo "[$(date +'%F %T')] $*"; }
+warn() { echo "WARN: $*" >&2; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+has()  { command -v "$1" >/dev/null 2>&1; }
+require_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root."; }
+
+ensure_tools() {
+  has curl || die "curl is required."
+  has jq || { apt-get install -y -q jq >/dev/null 2>&1 || true; }
+  has jq || die "jq is required (apt-get install -y jq)."
+  if [[ ! -x "$SB_BIN" ]]; then
+    log "Installing sing-box ${SB_VERSION}..."
+    local tmp; tmp="$(mktemp -d)"
+    curl -fsSL -o "$tmp/sb.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz" \
+      || die "sing-box download failed."
+    tar -xzf "$tmp/sb.tgz" -C "$tmp" >/dev/null 2>&1 || die "sing-box extract failed."
+    install -m 0755 "$tmp"/sing-box-*/sing-box "$SB_BIN"
+    rm -rf "$tmp"
+  fi
+}
+
+# Parse "host:port[:user:pass]" or "scheme://[user:pass@]host:port" -> P_HOST/P_PORT/P_USER/P_PASS
+parse_proxy() {
+  local line="${1:-}"; line="${line//[[:space:]]/}"
+  P_HOST=""; P_PORT=""; P_USER=""; P_PASS=""
+  [[ -n "$line" ]] || return 1
+  if [[ "$line" == *"://"* ]]; then
+    line="${line#*://}"
+    if [[ "$line" == *"@"* ]]; then
+      local c="${line%@*}" hp="${line##*@}"
+      P_USER="${c%%:*}"; P_PASS="${c#*:}"; P_HOST="${hp%%:*}"; P_PORT="${hp##*:}"
+    else P_HOST="${line%%:*}"; P_PORT="${line##*:}"; fi
+  else
+    local -a f=(); IFS=':' read -r -a f <<<"$line"
+    case "${#f[@]}" in
+      2) P_HOST="${f[0]}"; P_PORT="${f[1]}" ;;
+      4) P_HOST="${f[0]}"; P_PORT="${f[1]}"; P_USER="${f[2]}"; P_PASS="${f[3]}" ;;
+      *) return 1 ;;
+    esac
+  fi
+  [[ -n "$P_HOST" && "$P_PORT" =~ ^[0-9]+$ ]] || return 1
+  return 0
+}
+
+read_proxies() {
+  PROXIES=()
+  if [[ -n "$PROXY_FILE" ]]; then
+    [[ -f "$PROXY_FILE" ]] || die "File not found: $PROXY_FILE"
+    mapfile -t PROXIES < "$PROXY_FILE"; return 0
+  fi
+  local n; read -rp "How many UDP-capable SOCKS5 proxies? " n
+  [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] || die "Enter a number >= 1."
+  echo "Paste each SOCKS5 proxy (host:port:user:pass) — use the UDP/SOCKS5 port (not the HTTP one):"
+  local i l; for i in $(seq 1 "$n"); do read -rp "  proxy $i: " l; PROXIES+=("$l"); done
+}
+
+# Verify a proxy's SOCKS5 UDP ASSOCIATE works (so WARP/WireGuard can pass).
+proxy_udp_ok() {
+  local host="$1" port="$2" user="$3" pass="$4"
+  python3 - "$host" "$port" "$user" "$pass" 2>/dev/null <<'PY'
+import socket,struct,sys,os
+host,port,user,pwd=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]
+try:
+    t=socket.create_connection((host,port),timeout=8); t.settimeout(8)
+    t.sendall(b'\x05\x01\x02'); t.recv(2)
+    if user:
+        t.sendall(b'\x01'+bytes([len(user)])+user.encode()+bytes([len(pwd)])+pwd.encode());
+        if t.recv(2)[1]!=0: sys.exit(2)
+    t.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00'); r=t.recv(10)
+    if r[1]!=0: sys.exit(3)
+    bnd=socket.inet_ntoa(r[4:8]); bport=struct.unpack('!H',r[8:10])[0]
+    u=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); u.settimeout(6)
+    stun=b'\x00\x01\x00\x00\x21\x12\xa4\x42'+os.urandom(12)
+    ip=socket.gethostbyname('stun.l.google.com')
+    u.sendto(b'\x00\x00\x00\x01'+socket.inet_aton(ip)+struct.pack('!H',19302)+stun,(bnd,bport))
+    u.recvfrom(1024); sys.exit(0)
+except SystemExit: raise
+except Exception: sys.exit(1)
+PY
+}
+
+warp_account_confs() { ls "$WG_DIR"/*.conf 2>/dev/null || true; }
+
+cmd_setup() {
+  require_root; ensure_tools; mkdir -p "$STATE_DIR"
+  read_proxies
+
+  # keep valid proxies
+  local -a P=(); local l
+  for l in "${PROXIES[@]}"; do
+    [[ -n "${l//[[:space:]]/}" ]] || continue
+    if parse_proxy "$l"; then P+=("$l"); else warn "skip bad proxy line: $l"; fi
+  done
+  [[ "${#P[@]}" -ge 1 ]] || die "No valid proxies."
+
+  # established WARP accounts
+  local -a ACC=(); mapfile -t ACC < <(warp_account_confs)
+  [[ "${#ACC[@]}" -ge "${#P[@]}" ]] \
+    || die "Need >= ${#P[@]} WARP accounts in $WG_DIR (found ${#ACC[@]}). Install warp-multi (it creates them)."
+
+  # free the WARP keys: stop warp-multi netns tunnels so the keys aren't used twice
+  log "Freeing WARP accounts (stopping warp-multi netns tunnels)..."
+  local k
+  for k in $(seq 1 "${#ACC[@]}"); do systemctl stop "warp-netns@${k}.service" 2>/dev/null || true; done
+
+  # build sing-box config
+  local -a inbounds=() endpoints=() outbounds=() rules=() locals=()
+  local i=0 conf pk a4 a6 lport eh epp ep_i
+  for l in "${P[@]}"; do
+    i=$((i+1)); parse_proxy "$l"; conf="${ACC[$((i-1))]}"
+    pk="$(awk -F' = ' '/PrivateKey/{print $2; exit}' "$conf")"
+    a4="$(awk -F' = ' '/Address = 172/{print $2; exit}' "$conf")"
+    a6="$(awk -F' = ' '/Address = 2606/{print $2; exit}' "$conf")"
+    [[ -n "$pk" && -n "$a4" ]] || die "Bad WARP account: $conf"
+    # Use each account's own pinned endpoint (warp-multi already found a working one).
+    ep_i="$(awk -F' = ' '/Endpoint/{print $2; exit}' "$conf" | tr -d '[:space:]')"
+    [[ "$ep_i" == *:* ]] || ep_i="$WARP_ENDPOINT"
+    eh="${ep_i%:*}"; epp="${ep_i##*:}"
+    [[ "$epp" =~ ^[0-9]+$ ]] || { eh="${WARP_ENDPOINT%:*}"; epp="${WARP_ENDPOINT##*:}"; }
+    lport=$((BASE_PORT + i)); locals+=("127.0.0.1:${lport}")
+    inbounds+=("$(jq -nc --arg t "in$i" --argjson p "$lport" '{type:"socks",tag:$t,listen:"127.0.0.1",listen_port:$p}')")
+    endpoints+=("$(jq -nc --arg t "warp$i" --arg pk "$pk" --arg a4 "$a4" --arg a6 "${a6:-}" --arg det "px$i" --arg eh "$eh" --argjson ep "$epp" --arg pub "$WARP_PUBKEY" \
+      '{type:"wireguard",tag:$t,system:false,mtu:1280,address:([$a4]+(if $a6=="" then [] else [$a6] end)),private_key:$pk,detour:$det,
+        peers:[{address:$eh,port:$ep,public_key:$pub,allowed_ips:["0.0.0.0/0","::/0"]}]}')")
+    if [[ -n "$P_USER" ]]; then
+      outbounds+=("$(jq -nc --arg t "px$i" --arg s "$P_HOST" --argjson p "$P_PORT" --arg u "$P_USER" --arg pw "$P_PASS" '{type:"socks",tag:$t,server:$s,server_port:$p,version:"5",username:$u,password:$pw}')")
+    else
+      outbounds+=("$(jq -nc --arg t "px$i" --arg s "$P_HOST" --argjson p "$P_PORT" '{type:"socks",tag:$t,server:$s,server_port:$p,version:"5"}')")
+    fi
+    rules+=("$(jq -nc --arg in "in$i" --arg out "warp$i" '{inbound:[$in],outbound:$out}')")
+  done
+
+  local IN EP OUT RU
+  IN="$(printf '%s\n' "${inbounds[@]}" | jq -s .)"
+  EP="$(printf '%s\n' "${endpoints[@]}" | jq -s .)"
+  OUT="$(printf '%s\n' "${outbounds[@]}" | jq -s .)"
+  RU="$(printf '%s\n' "${rules[@]}" | jq -s .)"
+  jq -n --argjson inb "$IN" --argjson ep "$EP" --argjson outb "$OUT" --argjson ru "$RU" \
+    '{log:{level:"warn"},inbounds:$inb,endpoints:$ep,outbounds:($outb+[{type:"direct",tag:"direct"}]),route:{rules:$ru}}' > "$SB_CONF"
+  jq empty "$SB_CONF" 2>/dev/null || die "generated sing-box config is invalid."
+
+  # systemd service
+  cat > "/etc/systemd/system/${SB_SERVICE}.service" <<EOF
+[Unit]
+Description=warp-proxy (sing-box: WARP through SOCKS5 proxies)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${SB_BIN} run -c ${SB_CONF}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "${SB_SERVICE}" >/dev/null 2>&1 || true
+  systemctl restart "${SB_SERVICE}"
+  printf '%s\n' "${locals[@]}" > "$LOCALS_FILE"
+  log "sing-box started (${#locals[@]} WARP-through-proxy tunnels). Waiting for handshakes..."
+
+  # Wait until at least one tunnel handshakes (WARP through a proxy can take 15-40s).
+  local ok=0 lp r round
+  for round in $(seq 1 10); do
+    ok=0
+    for lp in "${locals[@]}"; do
+      curl -s --max-time 6 --socks5 "$lp" https://1.1.1.1/cdn-cgi/trace 2>/dev/null | grep -q '^warp=on' && ok=$((ok + 1))
+    done
+    [[ "$ok" -ge "${#locals[@]}" || "$round" -ge 8 ]] && break
+    sleep 4
+  done
+
+  # report exit IPs
+  echo "---- WARP exit IP per proxy ----"
+  for lp in "${locals[@]}"; do
+    r="$(curl -s --max-time 10 --socks5 "$lp" https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2; exit}')"
+    if [[ -n "$r" ]]; then printf "  %-18s -> WARP %s\n" "$lp" "$r"; else printf "  %-18s -> (down/retry)\n" "$lp"; fi
+  done
+  echo "--------------------------------"
+  [[ "$ok" -ge 1 ]] || die "No tunnel came up. Check: journalctl -u ${SB_SERVICE} -e --no-pager"
+  log "${ok}/${#locals[@]} WARP-through-proxy tunnels live."
+
+  # wire into x-ui via proxy-multi (balance/rotation across the local WARP SOCKS endpoints)
+  if has proxy-multi; then
+    log "Wiring into x-ui via proxy-multi (rotation ${ROTATE}m)..."
+    if [[ "$ROTATE" -gt 0 ]]; then
+      proxy-multi setup --file "$LOCALS_FILE" --rotate "$ROTATE"
+    else
+      proxy-multi setup --file "$LOCALS_FILE" --no-rotate
+    fi
+  else
+    echo "proxy-multi not installed. Point x-ui at these local SOCKS5: ${locals[*]}"
+  fi
+}
+
+cmd_status() {
+  systemctl status "${SB_SERVICE}" --no-pager 2>/dev/null | head -5 || true
+  [[ -f "$LOCALS_FILE" ]] || { echo "no tunnels configured"; return 0; }
+  local lp r
+  echo "---- WARP exit IP per proxy ----"
+  while IFS= read -r lp; do
+    [[ -n "$lp" ]] || continue
+    r="$(curl -s --max-time 12 --socks5 "$lp" https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2; exit}')"
+    printf "  %-18s -> %s\n" "$lp" "${r:-N/A}"
+  done < "$LOCALS_FILE"
+}
+
+cmd_down() {
+  require_root
+  systemctl disable --now "${SB_SERVICE}" >/dev/null 2>&1 || true
+  log "Stopped ${SB_SERVICE}."
+}
+
+usage() {
+  cat <<EOF
+warp-proxy v${VERSION} - one clean WARP IP per SOCKS5 proxy (chained through sing-box), for x-ui
+
+Usage:
+  warp-proxy setup [--file proxies.txt] [--rotate MIN]
+        Build sing-box WARP-through-proxy tunnels (reusing warp-multi's WARP accounts),
+        expose them as local SOCKS5, and wire them into x-ui via proxy-multi.
+  warp-proxy status      Show each tunnel's current WARP exit IP.
+  warp-proxy down        Stop the sing-box service.
+
+Notes:
+  - Proxies must be UDP-capable SOCKS5 (WARP is UDP). Use the SOCKS5/UDP port.
+  - Distinct WARP IPs = distinct proxy CITIES (proxies in the same city share a colo/IP).
+  - Needs >= (proxy count) WARP accounts in ${WG_DIR} (install warp-multi to create them).
+Env: BASE_PORT, ROTATE, WARP_ENDPOINT, SB_VERSION
+EOF
+}
+
+main() {
+  local cmd="${1:-setup}"; shift || true
+  PROXY_FILE=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file) PROXY_FILE="${2:?}"; shift 2 ;;
+      --rotate) ROTATE="${2:?}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ "$ROTATE" =~ ^[0-9]+$ ]] || die "--rotate must be a number."
+  case "$cmd" in
+    setup) cmd_setup ;;
+    status) cmd_status ;;
+    down) cmd_down ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) die "Unknown command: $cmd (use: warp-proxy --help)" ;;
+  esac
+}
+
+main "$@"
