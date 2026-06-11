@@ -9,10 +9,12 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 STATE_DIR="${STATE_DIR:-/etc/proxy-multi}"
 OUT_JSON="${OUT_JSON:-${STATE_DIR}/xray-outbounds.json}"
+PROXY_LIST="${PROXY_LIST:-${STATE_DIR}/proxies.list}"
+PROXY_ROTATE_FILE="${PROXY_ROTATE_FILE:-${STATE_DIR}/rotate.min}"
 
 GEO_URL="${GEO_URL:-https://ipinfo.io/json}"
 TRACE_URL="${TRACE_URL:-https://cloudflare.com/cdn-cgi/trace}"
@@ -26,6 +28,9 @@ BALANCER_STRATEGY="${BALANCER_STRATEGY:-random}"   # random | leastPing (leastPi
 XUI_DB="${XUI_DB:-/etc/x-ui/x-ui.db}"
 XUI_SERVICE="${XUI_SERVICE:-x-ui}"
 XRAY_KEY="${XRAY_KEY:-xrayTemplateConfig}"
+# When xrayTemplateConfig isn't in the DB yet (panel never customized), derive the base
+# template from the running Xray config (keep only the internal "api" inbound).
+XUI_RUNNING_CONFIG="${XUI_RUNNING_CONFIG:-/usr/local/x-ui/bin/config.json}"
 
 log()  { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
@@ -159,14 +164,10 @@ read_proxy_lines() {
   done
 }
 
-cmd_setup() {
-  ensure_tools
-  mkdir -p "$STATE_DIR"
-
-  local -a INPUT_LINES=()
-  read_proxy_lines
-
-  local -a outbounds=() tags=()
+# Test every line in INPUT_LINES, persist the valid ones to PROXY_LIST, generate
+# OUT_JSON from the working proxies, then auto-apply to x-ui.
+process_proxies() {
+  local -a outbounds=() tags=() saved=()
   local idx=0 line tag
   printf '\n%-24s %-6s %-16s %-26s %s\n' "PROXY" "PROTO" "EXIT_IP" "GEO" "STATUS"
   printf '%s\n' "--------------------------------------------------------------------------------"
@@ -176,6 +177,7 @@ cmd_setup() {
       printf '%-24s %-6s %-16s %-26s %s\n' "$line" "-" "-" "-" "BAD-FORMAT"
       continue
     fi
+    saved+=("$line")
     idx=$((idx + 1))
     tag="${TAG_PREFIX}$(printf '%02d' "$idx")"
     if test_proxy "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS" "$P_SCHEME"; then
@@ -188,18 +190,15 @@ cmd_setup() {
   done
   echo
 
+  # Persist the valid (parseable) lines so `add` can extend the list later.
+  if [[ "${#saved[@]}" -ge 1 ]]; then printf '%s\n' "${saved[@]}" > "$PROXY_LIST"; fi
+
   [[ "${#tags[@]}" -ge 1 ]] || die "No working proxy found; nothing to generate."
 
-  # Warn on duplicate exit IPs (no diversity benefit).
-  # (Best-effort: we only have IPs printed above; keeping it simple here.)
-
-  # Join outbound objects.
   local obs_joined="" o first=1
   for o in "${outbounds[@]}"; do
     if [[ "$first" -eq 1 ]]; then obs_joined="$o"; first=0; else obs_joined="${obs_joined},"$'\n'"$o"; fi
   done
-
-  # Build the selector tags array: "px01", "px02", ...
   local tags_joined="" t
   for t in "${tags[@]}"; do tags_joined="${tags_joined:+$tags_joined, }\"$(json_escape "$t")\""; done
 
@@ -219,13 +218,12 @@ ${obs_joined}
 }
 EOF
 
-  log "Generated config for ${#tags[@]} working proxy(ies): $OUT_JSON"
+  log "Generated config for ${#tags[@]} working proxy(ies): $OUT_JSON  (saved ${#saved[@]} in $PROXY_LIST)"
   echo "-------------------- Xray config --------------------"
   cat "$OUT_JSON"
   echo "-----------------------------------------------------"
   echo
 
-  # Full automation: if x-ui is on this box, apply straight into the panel.
   if [[ "${NO_APPLY:-0}" -ne 1 ]] && [[ -f "$XUI_DB" ]]; then
     log "x-ui detected ($XUI_DB) -> applying automatically..."
     cmd_apply
@@ -234,6 +232,42 @@ EOF
     echo "  Panel -> Xray Configs -> merge the 'outbounds' and 'routing' above,"
     echo "  replace YOUR_INBOUND_TAG with your inbound tag, Save, Restart."
   fi
+}
+
+cmd_setup() {
+  ensure_tools
+  mkdir -p "$STATE_DIR"
+  local -a INPUT_LINES=()
+  read_proxy_lines
+  process_proxies
+}
+
+# Append more proxies to the saved list without re-entering the old ones.
+cmd_add() {
+  ensure_tools
+  mkdir -p "$STATE_DIR"
+  local -a INPUT_LINES=()
+  [[ -f "$PROXY_LIST" ]] && mapfile -t INPUT_LINES < "$PROXY_LIST"
+  local had="${#INPUT_LINES[@]}"
+  log "Saved proxies so far: ${had}. New ones get appended (existing keep their px tags)."
+
+  if [[ -n "${PROXY_FILE:-}" ]]; then
+    local l
+    while IFS= read -r l; do [[ -n "${l//[[:space:]]/}" ]] && INPUT_LINES+=("$l"); done < "$PROXY_FILE"
+  else
+    local n
+    read -rp "How many MORE proxies to add? " n
+    [[ "$n" =~ ^[0-9]+$ ]] && [[ "$n" -ge 1 ]] || die "Enter a number >= 1."
+    echo "Paste each NEW proxy on its own line (host:port:user:pass)."
+    local i line
+    for i in $(seq 1 "$n"); do
+      read -rp "  new proxy $i: " line
+      [[ -n "${line//[[:space:]]/}" ]] && INPUT_LINES+=("$line")
+    done
+  fi
+
+  [[ "${#INPUT_LINES[@]}" -gt "$had" ]] || die "No new proxies were added."
+  process_proxies
 }
 
 # --- x-ui (3x-ui) auto-apply -------------------------------------------------
@@ -257,10 +291,18 @@ cmd_apply() {
   [[ -f "$OUT_JSON" ]] || die "No generated config ($OUT_JSON). Run: proxy-multi setup"
   [[ -f "$XUI_DB" ]]   || die "x-ui DB not found at $XUI_DB (set XUI_DB=/path/to/x-ui.db)."
 
-  # Current Xray template from the panel DB.
-  local tmpl
+  # Current Xray template from the panel DB; if it doesn't exist yet (panel never had its
+  # Xray config customized), derive the base from the running config — keep only the
+  # internal "api" inbound, since the panel re-injects the user inbounds from the DB.
+  local tmpl tmpl_missing=0
   tmpl="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='${XRAY_KEY}';" 2>/dev/null || true)"
-  [[ -n "$tmpl" ]] || die "Could not read '${XRAY_KEY}' from $XUI_DB."
+  if [[ -z "$tmpl" ]]; then
+    [[ -f "$XUI_RUNNING_CONFIG" ]] || die "No '${XRAY_KEY}' in DB and no running config at $XUI_RUNNING_CONFIG. Open Panel -> Xray Configs -> Save once, then re-run."
+    tmpl="$(jq '.inbounds = [((.inbounds // [])[]) | select(.tag == "api")]' "$XUI_RUNNING_CONFIG" 2>/dev/null || true)"
+    printf '%s' "$tmpl" | jq empty 2>/dev/null || die "Could not derive a base template from $XUI_RUNNING_CONFIG."
+    tmpl_missing=1
+    log "No saved Xray template in DB; derived base from running config (will create it)."
+  fi
   printf '%s' "$tmpl" | jq empty 2>/dev/null || die "Existing template is not valid JSON; aborting (DB untouched)."
 
   # Which inbound tags route through the proxies.
@@ -304,8 +346,7 @@ cmd_apply() {
     --arg baltag "$BALANCER_TAG" \
     --arg pfx "$TAG_PREFIX" '
     ($px[0].outbounds) as $pxob
-    | ($pxob | map(.tag)) as $pxtags
-    | .outbounds = ((.outbounds // []) | map(select(.tag as $t | ($pxtags | index($t)) | not))) + $pxob
+    | .outbounds = ((.outbounds // []) | map(select(((.tag // "") | test("^"+$pfx+"[0-9]+$")) | not))) + $pxob
     | .routing = (.routing // {})
     | .routing.balancers = ((.routing.balancers // []) | map(select(.tag != $baltag))) + $ourbal
     | .routing.rules = ((.routing.rules // []) | map(select(
@@ -315,9 +356,15 @@ cmd_apply() {
   ' 2>/dev/null)" || { warn "merge failed"; die "jq merge failed; DB untouched (backup: $bak)."; }
   printf '%s' "$merged" | jq empty 2>/dev/null || die "Merged config invalid; DB untouched (backup: $bak)."
 
-  # Write the merged template back (stream via stdin; escape single quotes for SQL).
+  # Write the merged template back: INSERT a new row if it didn't exist, else UPDATE.
   printf '%s' "$merged" > "${STATE_DIR}/merged-template.json"
-  if ! { printf "UPDATE settings SET value='"; sed "s/'/''/g" "${STATE_DIR}/merged-template.json"; printf "' WHERE key='%s';" "$XRAY_KEY"; } | sqlite3 "$XUI_DB"; then
+  local ok=1
+  if [[ "$tmpl_missing" -eq 1 ]]; then
+    { printf "INSERT INTO settings (key,value) VALUES ('%s','" "$XRAY_KEY"; sed "s/'/''/g" "${STATE_DIR}/merged-template.json"; printf "');"; } | sqlite3 "$XUI_DB" || ok=0
+  else
+    { printf "UPDATE settings SET value='"; sed "s/'/''/g" "${STATE_DIR}/merged-template.json"; printf "' WHERE key='%s';" "$XRAY_KEY"; } | sqlite3 "$XUI_DB" || ok=0
+  fi
+  if [[ "$ok" -ne 1 ]]; then
     cp -f "$bak" "$XUI_DB"
     die "DB write failed; restored backup ($bak)."
   fi
@@ -340,12 +387,14 @@ cmd_apply() {
     die "Rolled back to backup. Check: journalctl -u $XUI_SERVICE -e --no-pager"
   fi
 
-  # Rotation timer: install in rotate mode, remove otherwise.
+  # Rotation timer: install in rotate mode, remove otherwise. Persist the setting (sticky).
   if [[ "${ROTATE_MINUTES:-0}" -gt 0 ]]; then
     install_rotate_timer "$ROTATE_MINUTES"
+    echo "$ROTATE_MINUTES" > "$PROXY_ROTATE_FILE" 2>/dev/null || true
     log "Rotation ON: active proxy advances every ${ROTATE_MINUTES} min (round-robin, wraps to first)."
   else
     remove_rotate_timer
+    rm -f "$PROXY_ROTATE_FILE" 2>/dev/null || true
   fi
 
   if pgrep -f 'xray-linux-' >/dev/null 2>&1 || pgrep -x xray >/dev/null 2>&1; then
@@ -379,7 +428,7 @@ EOF
 Description=proxy-multi: rotate the active proxy every ${mins} min
 
 [Timer]
-OnBootSec=${mins}min
+OnActiveSec=${mins}min
 OnUnitActiveSec=${mins}min
 AccuracySec=10s
 
@@ -387,7 +436,8 @@ AccuracySec=10s
 WantedBy=timers.target
 EOF
   systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now proxy-multi-rotate.timer >/dev/null 2>&1 || true
+  systemctl enable proxy-multi-rotate.timer >/dev/null 2>&1 || true
+  systemctl restart proxy-multi-rotate.timer >/dev/null 2>&1 || true
 }
 
 remove_rotate_timer() {
@@ -447,6 +497,8 @@ proxy-multi v${VERSION} - turn a proxy list into an Xray (x-ui) balancer, automa
 Usage:
   proxy-multi setup [options]   Ask for proxies, test them, generate the config, and
                                 (if x-ui is on this box) apply it to the panel + restart.
+  proxy-multi add [options]     Append MORE proxies to the saved list (keeps existing px
+                                tags), re-test, and re-apply. No need to re-enter the old.
   proxy-multi apply [options]   Re-apply the last generated config to x-ui.
   proxy-multi rotate            Advance to the next proxy (used by the rotation timer).
 
@@ -478,23 +530,31 @@ main() {
   PROXY_FILE=""
   NO_APPLY=0
   APPLY_INBOUND=""
-  ROTATE_MINUTES="${ROTATE_MINUTES:-0}"
+  ROTATE_MINUTES=0
+  ROTATE_SET=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --file)     PROXY_FILE="${2:?}"; shift 2 ;;
-      --no-apply) NO_APPLY=1; shift ;;
-      --inbound)  APPLY_INBOUND="${2:?}"; shift 2 ;;
-      --db)       XUI_DB="${2:?}"; shift 2 ;;
-      --rotate)   ROTATE_MINUTES="${2:?}"; shift 2 ;;
-      --no-rotate) ROTATE_MINUTES=0; shift ;;
-      -h|--help)  usage; exit 0 ;;
+      --file)      PROXY_FILE="${2:?}"; shift 2 ;;
+      --no-apply)  NO_APPLY=1; shift ;;
+      --inbound)   APPLY_INBOUND="${2:?}"; shift 2 ;;
+      --db)        XUI_DB="${2:?}"; shift 2 ;;
+      --rotate)    ROTATE_MINUTES="${2:?}"; ROTATE_SET=1; shift 2 ;;
+      --no-rotate) ROTATE_MINUTES=0; ROTATE_SET=1; shift ;;
+      -h|--help)   usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
   [[ "$ROTATE_MINUTES" =~ ^[0-9]+$ ]] || die "--rotate must be a number of minutes."
+  # Sticky rotation: if neither --rotate nor --no-rotate was given, inherit the last
+  # setting so `add` (and re-`apply`) keep rotating without re-specifying it.
+  if [[ "$ROTATE_SET" -eq 0 && -f "$PROXY_ROTATE_FILE" ]]; then
+    ROTATE_MINUTES="$(cat "$PROXY_ROTATE_FILE" 2>/dev/null || echo 0)"
+    [[ "$ROTATE_MINUTES" =~ ^[0-9]+$ ]] || ROTATE_MINUTES=0
+  fi
 
   case "$cmd" in
     setup)  cmd_setup ;;
+    add)    cmd_add ;;
     apply)  cmd_apply ;;
     rotate) cmd_rotate ;;
     -h|--help|help) usage; exit 0 ;;
