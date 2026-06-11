@@ -9,7 +9,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 STATE_DIR="${STATE_DIR:-/etc/proxy-multi}"
 OUT_JSON="${OUT_JSON:-${STATE_DIR}/xray-outbounds.json}"
@@ -280,20 +280,38 @@ cmd_apply() {
   cp -f "$XUI_DB" "$bak" || die "DB backup failed; aborting."
   log "DB backed up: $bak"
 
-  # Merge proxy outbounds + balancer + routing rule into the template (idempotent).
+  # Build the routing rule + balancer set depending on mode:
+  #   rotate mode -> all traffic to ONE active proxy (the first), a timer cycles it;
+  #   balancer mode -> random load-balance across all proxies.
+  local ourbal ourrule
+  if [[ "${ROTATE_MINUTES:-0}" -gt 0 ]]; then
+    local firstpx
+    firstpx="$(jq -r '.outbounds[0].tag' "$OUT_JSON" 2>/dev/null || true)"
+    [[ -n "$firstpx" ]] || die "Could not read first proxy tag from $OUT_JSON."
+    ourbal='[]'
+    ourrule="$(jq -nc --argjson intags "$intags" --arg ob "$firstpx" '{type:"field", inboundTag:$intags, outboundTag:$ob}')"
+  else
+    ourbal="$(jq -c '.routing.balancers' "$OUT_JSON" 2>/dev/null || echo '[]')"
+    ourrule="$(jq -nc --argjson intags "$intags" --arg bt "$BALANCER_TAG" '{type:"field", inboundTag:$intags, balancerTag:$bt}')"
+  fi
+
+  # Merge into the template (idempotent; cleans up the other mode; preserves existing config).
   local merged
   merged="$(printf '%s' "$tmpl" | jq \
     --slurpfile px "$OUT_JSON" \
-    --argjson intags "$intags" \
-    --arg baltag "$BALANCER_TAG" '
+    --argjson ourbal "$ourbal" \
+    --argjson ourrule "$ourrule" \
+    --arg baltag "$BALANCER_TAG" \
+    --arg pfx "$TAG_PREFIX" '
     ($px[0].outbounds) as $pxob
     | ($pxob | map(.tag)) as $pxtags
-    | ($px[0].routing.balancers) as $pxbal
-    | {type:"field", inboundTag:$intags, balancerTag:$baltag} as $rule
     | .outbounds = ((.outbounds // []) | map(select(.tag as $t | ($pxtags | index($t)) | not))) + $pxob
     | .routing = (.routing // {})
-    | .routing.balancers = ((.routing.balancers // []) | map(select(.tag != $baltag))) + $pxbal
-    | .routing.rules = ((.routing.rules // []) | map(select((.balancerTag // "") != $baltag))) + [$rule]
+    | .routing.balancers = ((.routing.balancers // []) | map(select(.tag != $baltag))) + $ourbal
+    | .routing.rules = ((.routing.rules // []) | map(select(
+          ((.balancerTag // "") != $baltag)
+          and (((.outboundTag // "") | test("^"+$pfx+"[0-9]+$")) | not)
+      ))) + [$ourrule]
   ' 2>/dev/null)" || { warn "merge failed"; die "jq merge failed; DB untouched (backup: $bak)."; }
   printf '%s' "$merged" | jq empty 2>/dev/null || die "Merged config invalid; DB untouched (backup: $bak)."
 
@@ -306,7 +324,11 @@ cmd_apply() {
   local nprox routed
   nprox="$(jq '.outbounds | length' "$OUT_JSON" 2>/dev/null || echo '?')"
   routed="$(printf '%s' "$intags" | jq -cr 'join(", ")' 2>/dev/null || echo '?')"
-  log "x-ui Xray template updated (${nprox} proxies; routing [${routed}] -> ${BALANCER_TAG})."
+  if [[ "${ROTATE_MINUTES:-0}" -gt 0 ]]; then
+    log "x-ui template updated (${nprox} proxies; ALL of [${routed}] -> one active proxy, rotating)."
+  else
+    log "x-ui template updated (${nprox} proxies; [${routed}] -> ${BALANCER_TAG} random)."
+  fi
 
   # Restart and verify; auto-rollback if the panel fails to come up.
   systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
@@ -318,12 +340,104 @@ cmd_apply() {
     die "Rolled back to backup. Check: journalctl -u $XUI_SERVICE -e --no-pager"
   fi
 
+  # Rotation timer: install in rotate mode, remove otherwise.
+  if [[ "${ROTATE_MINUTES:-0}" -gt 0 ]]; then
+    install_rotate_timer "$ROTATE_MINUTES"
+    log "Rotation ON: active proxy advances every ${ROTATE_MINUTES} min (round-robin, wraps to first)."
+  else
+    remove_rotate_timer
+  fi
+
   if pgrep -f 'xray-linux-' >/dev/null 2>&1 || pgrep -x xray >/dev/null 2>&1; then
-    log "Done. Proxy balancer is LIVE in x-ui. Backup: $bak"
+    log "Done. Proxies are LIVE in x-ui. Backup: $bak"
   else
     warn "Panel is up but no Xray process detected — config may be rejected."
     warn "Rollback if needed:  cp '$bak' '$XUI_DB' && systemctl restart $XUI_SERVICE"
   fi
+}
+
+# --- rotation (time-based: one active proxy at a time, cycled by a systemd timer) ---
+
+ROTATE_SERVICE_FILE="/etc/systemd/system/proxy-multi-rotate.service"
+ROTATE_TIMER_FILE="/etc/systemd/system/proxy-multi-rotate.timer"
+
+install_rotate_timer() {
+  local mins="$1"
+  local self
+  self="$(readlink -f "$0" 2>/dev/null || true)"
+  [[ -n "$self" ]] || self="/usr/local/bin/proxy-multi"
+  cat > "$ROTATE_SERVICE_FILE" <<EOF
+[Unit]
+Description=proxy-multi: rotate the active proxy
+
+[Service]
+Type=oneshot
+ExecStart=${self} rotate
+EOF
+  cat > "$ROTATE_TIMER_FILE" <<EOF
+[Unit]
+Description=proxy-multi: rotate the active proxy every ${mins} min
+
+[Timer]
+OnBootSec=${mins}min
+OnUnitActiveSec=${mins}min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now proxy-multi-rotate.timer >/dev/null 2>&1 || true
+}
+
+remove_rotate_timer() {
+  if [[ -f "$ROTATE_TIMER_FILE" || -f "$ROTATE_SERVICE_FILE" ]]; then
+    systemctl disable --now proxy-multi-rotate.timer >/dev/null 2>&1 || true
+    rm -f "$ROTATE_TIMER_FILE" "$ROTATE_SERVICE_FILE"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_rotate() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root."
+  ensure_apply_tools
+  [[ -f "$XUI_DB" ]] || die "x-ui DB not found at $XUI_DB."
+  mkdir -p "$STATE_DIR"
+
+  local tmpl
+  tmpl="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='${XRAY_KEY}';" 2>/dev/null || true)"
+  [[ -n "$tmpl" ]] || die "Could not read '${XRAY_KEY}' from $XUI_DB."
+
+  # Current active proxy = the routing rule whose outboundTag is one of ours (px##).
+  local cur
+  cur="$(printf '%s' "$tmpl" | jq -r --arg pfx "$TAG_PREFIX" \
+    'first(.routing.rules[]? | select((.outboundTag // "") | test("^"+$pfx+"[0-9]+$")) | .outboundTag) // ""')"
+  [[ -n "$cur" ]] || die "No rotation rule found (not in rotate mode). Run: proxy-multi setup --rotate <min>"
+
+  # Next proxy (sorted px tags, wrap around).
+  local next
+  next="$(printf '%s' "$tmpl" | jq -r --arg pfx "$TAG_PREFIX" --arg cur "$cur" \
+    '([.outbounds[].tag | select(test("^"+$pfx+"[0-9]+$"))] | sort) as $l
+     | ($l | index($cur)) as $i
+     | if ($l|length)==0 then "" elif $i==null then $l[0] else $l[(($i+1) % ($l|length))] end')"
+  [[ -n "$next" ]] || die "Could not compute next proxy."
+
+  if [[ "$next" == "$cur" ]]; then
+    log "Only one proxy; nothing to rotate."
+    return 0
+  fi
+
+  local merged
+  merged="$(printf '%s' "$tmpl" | jq --arg pfx "$TAG_PREFIX" --arg next "$next" \
+    '.routing.rules |= map(if ((.outboundTag // "") | test("^"+$pfx+"[0-9]+$")) then .outboundTag=$next else . end)')"
+  printf '%s' "$merged" | jq empty 2>/dev/null || die "Rotation produced invalid JSON; aborting."
+
+  printf '%s' "$merged" > "${STATE_DIR}/merged-template.json"
+  { printf "UPDATE settings SET value='"; sed "s/'/''/g" "${STATE_DIR}/merged-template.json"; printf "' WHERE key='%s';" "$XRAY_KEY"; } | sqlite3 "$XUI_DB" \
+    || die "DB write failed during rotation."
+
+  systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+  log "Rotated active proxy: ${cur} -> ${next}"
 }
 
 usage() {
@@ -334,11 +448,16 @@ Usage:
   proxy-multi setup [options]   Ask for proxies, test them, generate the config, and
                                 (if x-ui is on this box) apply it to the panel + restart.
   proxy-multi apply [options]   Re-apply the last generated config to x-ui.
+  proxy-multi rotate            Advance to the next proxy (used by the rotation timer).
 
 Options:
   --file FILE        Read proxies from FILE (one per line) instead of asking.
   --inbound TAGS     Route only these inbound tags (comma-separated) through the proxies.
                      Default: all enabled inbounds. Use "all" for the same.
+  --rotate MIN       Time-rotation: send ALL traffic through ONE proxy and switch to the
+                     next every MIN minutes (round-robin, wraps to the first). Installs a
+                     systemd timer. Note: each switch restarts x-ui (brief blip).
+  --no-rotate        Switch back to random load-balancing across all proxies (default).
   --no-apply         Only generate the config; do not touch x-ui.
   --db PATH          x-ui database path (default: ${XUI_DB}).
 
@@ -359,20 +478,25 @@ main() {
   PROXY_FILE=""
   NO_APPLY=0
   APPLY_INBOUND=""
+  ROTATE_MINUTES="${ROTATE_MINUTES:-0}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --file)     PROXY_FILE="${2:?}"; shift 2 ;;
       --no-apply) NO_APPLY=1; shift ;;
       --inbound)  APPLY_INBOUND="${2:?}"; shift 2 ;;
       --db)       XUI_DB="${2:?}"; shift 2 ;;
+      --rotate)   ROTATE_MINUTES="${2:?}"; shift 2 ;;
+      --no-rotate) ROTATE_MINUTES=0; shift ;;
       -h|--help)  usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
+  [[ "$ROTATE_MINUTES" =~ ^[0-9]+$ ]] || die "--rotate must be a number of minutes."
 
   case "$cmd" in
-    setup) cmd_setup ;;
-    apply) cmd_apply ;;
+    setup)  cmd_setup ;;
+    apply)  cmd_apply ;;
+    rotate) cmd_rotate ;;
     -h|--help|help) usage; exit 0 ;;
     *) die "Unknown command: $cmd (use: proxy-multi --help)" ;;
   esac
