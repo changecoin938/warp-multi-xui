@@ -7,7 +7,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.8"
+VERSION="0.2.0"
 
 CONFIG_FILE="/etc/warp-multi.conf"
 WG_DIR="/etc/wireguard"
@@ -45,10 +45,27 @@ WARP_ENDPOINT_PORTS_DEFAULT="2408,500,1701,4500"
 WARP_HANDSHAKE_WAIT_DEFAULT=12
 WARP_HANDSHAKE_TRY_WAIT_DEFAULT=6
 
+# Consumer-WARP endpoint IPv4 prefixes (anycast). WARP's IPv4 *exit* IP is shared per
+# Cloudflare colo, and different prefixes can route to different colos -- so spreading
+# tunnels across these prefixes is the main lever for distinct IPv4 exit IPs. The DNS
+# host above usually resolves to only 1-2 of these, which is why we add the full list.
+WARP_ENDPOINT_CIDRS_DEFAULT="162.159.192.0/24 162.159.193.0/24 162.159.195.0/24 162.159.204.0/24 188.114.96.0/24 188.114.97.0/24 188.114.98.0/24 188.114.99.0/24"
+
 # Auto-recover dead/stale WARP accounts (only after handshake fails and we already tried endpoints/ports)
 AUTORENEW_ON_FAIL_DEFAULT=1
 AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT=86400   # seconds (1 day); applies to auto re-register
 AUTORENEW_COOLDOWN_DEFAULT=21600          # seconds (6 hours) between auto attempts per tunnel
+
+# Egress source-IP binding: when the uplink has multiple public IPv4s, bind each
+# tunnel to a different source IP via SNAT (round-robin by index) so the extra IPs
+# are actually used. "auto" = enable when >=2 IPv4s; "off" = always MASQUERADE.
+EGRESS_IP_BIND_DEFAULT="auto"
+
+# Post-install/rotate exit-IP de-duplication (rotate tunnels that share an exit IP)
+DEDUPE_ROUNDS_DEFAULT=3
+
+# Optional WARP+ license key (applied via wgcf). Empty = plain free WARP.
+WARP_PLUS_LICENSE_DEFAULT=""
 
 log() { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
@@ -62,7 +79,9 @@ has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 is_ipv4() {
   local ip="${1:-}"
-  [[ "$ip" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]] || return 1
+  # Use [.] (character class) for the literal dot: it is unambiguous across all bash
+  # versions, unlike \\. which can be mis-parsed in unquoted [[ =~ ]] regexes.
+  [[ "$ip" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]] || return 1
 
   local o1 o2 o3 o4
   IFS='.' read -r o1 o2 o3 o4 <<<"$ip"
@@ -209,6 +228,90 @@ pick_unused_endpoint_combo() {
   echo "${ips[$ip_idx]}:${ports[$port_idx]}"
 }
 
+# ---- WARP endpoint prefix pool (the main lever for distinct IPv4 exit IPs) ----
+# WARP's IPv4 exit IP is shared per colo; different endpoint /24 prefixes can route to
+# different colos. We spread tunnels across the prefix pool so each tunnel has the best
+# chance of a distinct IPv4 exit. (Port does not affect the exit IP, only reachability.)
+
+# List the /24 "prefix" (first three octets) of each pool CIDR, deduplicated.
+warp_pool_prefixes() {
+  local -a cidrs=()
+  read -r -a cidrs <<<"${WARP_ENDPOINT_CIDRS:-$WARP_ENDPOINT_CIDRS_DEFAULT}"
+  local c base
+  for c in "${cidrs[@]}"; do
+    [[ -n "${c:-}" ]] || continue
+    base="${c%/*}"      # 162.159.192.0
+    echo "${base%.*}"   # 162.159.192
+  done | awk 'NF && !seen[$0]++'
+}
+
+# A spread host octet (1..254), varied by tunnel index and an offset.
+warp_pool_host_octet() {
+  local i="${1:?}"
+  local offset="${2:-0}"
+  echo $(( ( (i * 37) + (offset * 113) ) % 254 + 1 ))
+}
+
+# Pick a WARP endpoint "IP:port" for tunnel i from the prefix pool. `offset` shifts the
+# prefix/host so retries and dedupe can try a different colo.
+warp_pool_endpoint_for_index() {
+  local i="${1:?}"
+  local offset="${2:-0}"
+
+  local -a prefixes=()
+  mapfile -t prefixes < <(warp_pool_prefixes)
+  [[ "${#prefixes[@]}" -ge 1 ]] || return 1
+
+  local -a ports=()
+  mapfile -t ports < <(parse_ports_csv "${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}" 2>/dev/null || true)
+  [[ "${#ports[@]}" -ge 1 ]] || ports=(2408)
+
+  local p_idx=$(( (i - 1 + offset) % ${#prefixes[@]} ))
+  local host port
+  host="$(warp_pool_host_octet "$i" "$offset")"
+  port="${ports[$(( (i - 1 + offset) % ${#ports[@]} ))]}"
+  echo "${prefixes[$p_idx]}.${host}:${port}"
+}
+
+# Pick a pool endpoint whose /24 prefix isn't already used by another active tunnel, so
+# each (re)created tunnel lands on a different colo than its siblings where possible.
+pick_unused_pool_endpoint() {
+  local i="${1:?}"
+
+  local -a prefixes=()
+  mapfile -t prefixes < <(warp_pool_prefixes)
+  [[ "${#prefixes[@]}" -ge 1 ]] || return 1
+
+  declare -A used=()
+  local ep host pfx
+  while IFS= read -r ep; do
+    [[ -n "${ep:-}" ]] || continue
+    host="${ep%:*}"
+    is_ipv4 "$host" || continue
+    used["${host%.*}"]=1
+  done < <(list_active_endpoints "$i" 2>/dev/null || true)
+
+  local -a ports=()
+  mapfile -t ports < <(parse_ports_csv "${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}" 2>/dev/null || true)
+  [[ "${#ports[@]}" -ge 1 ]] || ports=(2408)
+
+  local start=$(( (i - 1) % ${#prefixes[@]} ))
+  local off idx pfx2 hostoct port
+  for off in $(seq 0 $(( ${#prefixes[@]} - 1 ))); do
+    idx=$(( (start + off) % ${#prefixes[@]} ))
+    pfx2="${prefixes[$idx]}"
+    if [[ -z "${used[$pfx2]:-}" ]]; then
+      hostoct="$(warp_pool_host_octet "$i" "$off")"
+      port="${ports[$(( (i - 1 + off) % ${#ports[@]} ))]}"
+      echo "${pfx2}.${hostoct}:${port}"
+      return 0
+    fi
+  done
+
+  # More tunnels than prefixes: fall back to a by-index spread (some colo reuse is unavoidable).
+  warp_pool_endpoint_for_index "$i" "$(( (i * 3) % 7 ))"
+}
+
 ensure_defaults() {
   COUNT="${COUNT:-$COUNT_DEFAULT}"
   BASE_PORT="${BASE_PORT:-$BASE_PORT_DEFAULT}"
@@ -233,12 +336,17 @@ ensure_defaults() {
   WARP_ENDPOINT_HOST="${WARP_ENDPOINT_HOST:-$WARP_ENDPOINT_HOST_DEFAULT}"
   WARP_ENDPOINT_HOST="$(normalize_endpoint_host "$WARP_ENDPOINT_HOST")"
   WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+  WARP_ENDPOINT_CIDRS="${WARP_ENDPOINT_CIDRS:-$WARP_ENDPOINT_CIDRS_DEFAULT}"
   WARP_HANDSHAKE_WAIT="${WARP_HANDSHAKE_WAIT:-$WARP_HANDSHAKE_WAIT_DEFAULT}"
   WARP_HANDSHAKE_TRY_WAIT="${WARP_HANDSHAKE_TRY_WAIT:-$WARP_HANDSHAKE_TRY_WAIT_DEFAULT}"
 
   AUTORENEW_ON_FAIL="${AUTORENEW_ON_FAIL:-$AUTORENEW_ON_FAIL_DEFAULT}"
   AUTORENEW_MIN_ACCOUNT_AGE="${AUTORENEW_MIN_ACCOUNT_AGE:-$AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT}"
   AUTORENEW_COOLDOWN="${AUTORENEW_COOLDOWN:-$AUTORENEW_COOLDOWN_DEFAULT}"
+
+  EGRESS_IP_BIND="${EGRESS_IP_BIND:-$EGRESS_IP_BIND_DEFAULT}"
+  DEDUPE_ROUNDS="${DEDUPE_ROUNDS:-$DEDUPE_ROUNDS_DEFAULT}"
+  WARP_PLUS_LICENSE="${WARP_PLUS_LICENSE:-$WARP_PLUS_LICENSE_DEFAULT}"
 }
 
 load_config() {
@@ -270,11 +378,15 @@ save_config() {
     printf 'EXIT_IP_URL=%q\n' "$EXIT_IP_URL"
     printf 'WARP_ENDPOINT_HOST=%q\n' "$WARP_ENDPOINT_HOST"
     printf 'WARP_ENDPOINT_PORTS=%q\n' "$WARP_ENDPOINT_PORTS"
+    printf 'WARP_ENDPOINT_CIDRS=%q\n' "$WARP_ENDPOINT_CIDRS"
     printf 'WARP_HANDSHAKE_WAIT=%q\n' "$WARP_HANDSHAKE_WAIT"
     printf 'WARP_HANDSHAKE_TRY_WAIT=%q\n' "$WARP_HANDSHAKE_TRY_WAIT"
     printf 'AUTORENEW_ON_FAIL=%q\n' "$AUTORENEW_ON_FAIL"
     printf 'AUTORENEW_MIN_ACCOUNT_AGE=%q\n' "$AUTORENEW_MIN_ACCOUNT_AGE"
     printf 'AUTORENEW_COOLDOWN=%q\n' "$AUTORENEW_COOLDOWN"
+    printf 'EGRESS_IP_BIND=%q\n' "$EGRESS_IP_BIND"
+    printf 'DEDUPE_ROUNDS=%q\n' "$DEDUPE_ROUNDS"
+    printf 'WARP_PLUS_LICENSE=%q\n' "$WARP_PLUS_LICENSE"
   } >"$CONFIG_FILE"
 }
 
@@ -303,6 +415,34 @@ detect_uplink() {
   fi
 
   echo ""
+}
+
+# Public/global IPv4 addresses configured on the uplink interface (deduplicated).
+list_uplink_ipv4s() {
+  local iface="${1:-${UPLINK_IF:-}}"
+  [[ -n "${iface:-}" ]] || return 1
+  ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
+    | awk '{print $4}' | cut -d/ -f1 \
+    | awk 'NF && !seen[$0]++'
+}
+
+# Pick a source IPv4 for tunnel index i (round-robin across the uplink's IPv4s).
+egress_ip_for_index() {
+  local i="${1:?}"
+  local -a ips=()
+  mapfile -t ips < <(list_uplink_ipv4s 2>/dev/null || true)
+  [[ "${#ips[@]}" -ge 1 ]] || return 1
+  local idx=$(( (i - 1) % ${#ips[@]} ))
+  echo "${ips[$idx]}"
+}
+
+# Whether to SNAT each tunnel to its own source IP (only when >=2 IPv4s and not disabled).
+egress_bind_enabled() {
+  [[ "${EGRESS_IP_BIND:-$EGRESS_IP_BIND_DEFAULT}" != "off" ]] || return 1
+  local n
+  n="$(list_uplink_ipv4s 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+  [[ "${n:-0}" =~ ^[0-9]+$ ]] || return 1
+  [[ "$n" -ge 2 ]]
 }
 
 arch_suffix() {
@@ -571,19 +711,24 @@ pin_warp_endpoint() {
   cur_port="${cur_ep##*:}"
   [[ "$cur_port" =~ ^[0-9]+$ ]] || cur_port="2408"
 
-  # If it's already an IP, keep it.
+  # If it's already an IP, keep it (stable across restarts).
   if is_ipv4 "$cur_host"; then
     return 0
   fi
 
-  host="$cur_host"
-  if [[ -z "${host:-}" ]] || [[ "$host" == "$WARP_ENDPOINT_HOST_DEFAULT" ]]; then
-    host="$(warp_endpoint_host)"
-  fi
-  [[ -n "${host:-}" ]] || return 0
+  # Prefer a pool endpoint spread across prefixes so each tunnel targets a different colo.
+  combo="$(warp_pool_endpoint_for_index "$i" 0 2>/dev/null || true)"
 
-  ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT},${cur_port}"
-  combo="$(pick_endpoint_combo_for_index "$i" "$host" "$ports_csv" 2>/dev/null || true)"
+  # Fallback: the DNS A-records of the WARP host.
+  if [[ -z "${combo:-}" ]]; then
+    host="$cur_host"
+    if [[ -z "${host:-}" ]] || [[ "$host" == "$WARP_ENDPOINT_HOST_DEFAULT" ]]; then
+      host="$(warp_endpoint_host)"
+    fi
+    [[ -n "${host:-}" ]] || return 0
+    ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT},${cur_port}"
+    combo="$(pick_endpoint_combo_for_index "$i" "$host" "$ports_csv" 2>/dev/null || true)"
+  fi
   [[ -n "${combo:-}" ]] || return 0
 
   ip="${combo%:*}"
@@ -598,6 +743,12 @@ normalize_warp_conf() {
 
   # Avoid letting wg-quick manage DNS in host; we set netns resolv.conf instead.
   sed -i '/^DNS =/d' "$conf" 2>/dev/null || true
+
+  # Ensure WARP's standard MTU (1280) is present to avoid PMTU/fragmentation handshake
+  # failures; don't override a value the user/wgcf already set.
+  if ! grep -q '^MTU[[:space:]]*=' "$conf" 2>/dev/null; then
+    sed -i '/^\[Interface\]/a MTU = 1280' "$conf" 2>/dev/null || true
+  fi
 
   # Keepalive helps on some VPS providers.
   if ! grep -q '^PersistentKeepalive' "$conf" 2>/dev/null; then
@@ -615,10 +766,15 @@ set_unused_warp_endpoint() {
   local conf="${2:?}"
 
   local host ports_csv combo ip port
-  host="$(warp_endpoint_host)"
-  ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+  # Prefer a pool prefix not used by sibling tunnels (distinct colo -> distinct IPv4 exit).
+  combo="$(pick_unused_pool_endpoint "$i" 2>/dev/null || true)"
 
-  combo="$(pick_unused_endpoint_combo "$i" "$host" "$ports_csv" 2>/dev/null || true)"
+  # Fallback: avoid duplicate DNS-A-record endpoints.
+  if [[ -z "${combo:-}" ]]; then
+    host="$(warp_endpoint_host)"
+    ports_csv="${WARP_ENDPOINT_PORTS:-$WARP_ENDPOINT_PORTS_DEFAULT}"
+    combo="$(pick_unused_endpoint_combo "$i" "$host" "$ports_csv" 2>/dev/null || true)"
+  fi
   [[ -n "${combo:-}" ]] || return 0
 
   ip="${combo%:*}"
@@ -677,6 +833,16 @@ gen_warp_conf() {
       exit 43
     done
 
+    # Optionally upgrade the account to WARP+ with a license key (non-fatal if it fails).
+    if [[ -n "${WARP_PLUS_LICENSE:-}" ]] && [[ -f wgcf-account.toml ]]; then
+      if grep -q '^license_key' wgcf-account.toml; then
+        sed -i -E "s|^license_key.*|license_key = \"${WARP_PLUS_LICENSE}\"|" wgcf-account.toml || true
+      else
+        printf 'license_key = "%s"\n' "$WARP_PLUS_LICENSE" >>wgcf-account.toml || true
+      fi
+      wgcf update >/dev/null 2>&1 || echo "WARN: wgcf update (WARP+ license) failed for warp${i}; continuing on free WARP." >&2
+    fi
+
     out="$(wgcf generate 2>&1)" || { echo "$out" >&2; exit 44; }
     cp wgcf-profile.conf "$conf"
     date +%s >created_at
@@ -705,7 +871,7 @@ Type=oneshot
 RemainAfterExit=yes
 Restart=on-failure
 RestartSec=3
-TimeoutStartSec=120
+TimeoutStartSec=300
 ExecStart=/usr/local/bin/warp-multi ns-up %i
 ExecStop=/usr/local/bin/warp-multi ns-down %i
 
@@ -733,6 +899,12 @@ EOFUNIT2
 }
 
 cmd_install() {
+  # Allow `install --help` without root.
+  local _a
+  for _a in "$@"; do
+    case "$_a" in -h|--help) usage_install; exit 0 ;; esac
+  done
+
   require_root
 
   # start from defaults
@@ -753,11 +925,15 @@ cmd_install() {
   EXIT_IP_URL="$EXIT_IP_URL_DEFAULT"
   WARP_ENDPOINT_HOST="$WARP_ENDPOINT_HOST_DEFAULT"
   WARP_ENDPOINT_PORTS="$WARP_ENDPOINT_PORTS_DEFAULT"
+  WARP_ENDPOINT_CIDRS="$WARP_ENDPOINT_CIDRS_DEFAULT"
   WARP_HANDSHAKE_WAIT="$WARP_HANDSHAKE_WAIT_DEFAULT"
   WARP_HANDSHAKE_TRY_WAIT="$WARP_HANDSHAKE_TRY_WAIT_DEFAULT"
   AUTORENEW_ON_FAIL="$AUTORENEW_ON_FAIL_DEFAULT"
   AUTORENEW_MIN_ACCOUNT_AGE="$AUTORENEW_MIN_ACCOUNT_AGE_DEFAULT"
   AUTORENEW_COOLDOWN="$AUTORENEW_COOLDOWN_DEFAULT"
+  EGRESS_IP_BIND="$EGRESS_IP_BIND_DEFAULT"
+  DEDUPE_ROUNDS="$DEDUPE_ROUNDS_DEFAULT"
+  WARP_PLUS_LICENSE="$WARP_PLUS_LICENSE_DEFAULT"
   UPLINK_IF=""
 
   local old_count=""
@@ -782,6 +958,8 @@ cmd_install() {
       --register-retries) REGISTER_RETRIES="${2:?}"; shift 2 ;;
       --register-backoff-base) REGISTER_BACKOFF_BASE="${2:?}"; shift 2 ;;
       --register-backoff-max) REGISTER_BACKOFF_MAX="${2:?}"; shift 2 ;;
+      --egress-ip-bind) EGRESS_IP_BIND="${2:?}"; shift 2 ;;
+      --warp-plus-license) WARP_PLUS_LICENSE="${2:?}"; shift 2 ;;
       -h|--help) usage_install; exit 0 ;;
       *) die "Unknown flag: $1" ;;
     esac
@@ -789,10 +967,24 @@ cmd_install() {
 
   [[ "$COUNT" =~ ^[0-9]+$ ]] || die "--count must be a number"
   [[ "$COUNT" -ge 1 ]] || die "--count must be >= 1"
+  [[ "$COUNT" -le 254 ]] || die "--count must be <= 254 (the index is the 3rd octet of ${BASE_NET}.<i>.0/24)"
   [[ "$COUNT" -le 200 ]] || warn "High --count ($COUNT). Consider <= 200 to keep routing manageable."
+
+  # BASE_NET must be a two-octet IPv4 prefix "A.B" (becomes A.B.<i>.0/24).
+  [[ "$BASE_NET" =~ ^[0-9]{1,3}[.][0-9]{1,3}$ ]] || die "--base-net must be A.B (two octets 0-255), e.g. 10.250"
+  local _bn1 _bn2
+  IFS='.' read -r _bn1 _bn2 <<<"$BASE_NET"
+  [[ "$_bn1" -ge 0 && "$_bn1" -le 255 && "$_bn2" -ge 0 && "$_bn2" -le 255 ]] \
+    || die "--base-net octets must be 0-255 (got: $BASE_NET)"
 
   [[ "$BASE_PORT" =~ ^[0-9]+$ ]] || die "--base-port must be a number"
   [[ "$BASE_PORT" -ge 1024 ]] || warn "--base-port < 1024 needs extra care; continuing anyway."
+  [[ $((BASE_PORT + COUNT)) -le 65535 ]] || die "--base-port + --count exceeds 65535 (SOCKS ports would overflow). Lower --base-port or --count."
+
+  case "${EGRESS_IP_BIND:-auto}" in
+    auto|off) ;;
+    *) die "--egress-ip-bind must be 'auto' or 'off'" ;;
+  esac
 
   [[ "$REGISTER_DELAY" =~ ^[0-9]+$ ]] || die "--register-delay must be a number (seconds)"
   [[ "$REGISTER_RETRIES" =~ ^[0-9]+$ ]] || die "--register-retries must be a number"
@@ -844,7 +1036,8 @@ cmd_install() {
     else
       gen_warp_conf "$i"
       if [[ "$REGISTER_DELAY" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
-        sleep "$REGISTER_DELAY"
+        # Add a little jitter so registrations aren't perfectly periodic (less bot-like).
+        sleep $(( REGISTER_DELAY + (RANDOM % 4) ))
       fi
     fi
     systemctl enable --quiet "warp-netns@${i}.service" "warp-socks@${i}.service" 2>/dev/null || true
@@ -863,6 +1056,12 @@ cmd_install() {
 
   log "Installed. SOCKS5 endpoints:"
   cmd_proxies
+
+  if egress_bind_enabled; then
+    log "Multiple public IPv4s detected: each tunnel is SNATed to its own source IP (disable with --egress-ip-bind off)."
+  fi
+
+  log "Tip: check exit IPs with 'warp-multi ips', then remove any duplicates with 'warp-multi dedupe'."
 
   if [[ "$start_failed" -eq 1 ]]; then
     warn "Some tunnels didn't start cleanly. systemd will retry (Restart=on-failure). Check: warp-multi status"
@@ -945,8 +1144,20 @@ warp_try_fix_handshake() {
     ips+=("$ip")
   done < <(resolve_endpoint_ipv4s "$host" 2>/dev/null || true)
 
+  # Add a spread of pool IPs (different prefixes -> different colos) as extra candidates.
+  local _po pool_ip
+  for _po in 0 1 2 3 4 5 6 7; do
+    pool_ip="$(warp_pool_endpoint_for_index "$i" "$_po" 2>/dev/null || true)"
+    pool_ip="${pool_ip%:*}"
+    [[ -n "${pool_ip:-}" ]] && is_ipv4 "$pool_ip" && ips+=("$pool_ip")
+  done
+
   if [[ "${#ips[@]}" -gt 0 ]]; then
     mapfile -t ips < <(printf '%s\n' "${ips[@]}" | awk 'NF && !seen[$0]++')
+  fi
+  # Cap candidate IPs so the retry loop stays within the systemd start timeout.
+  if [[ "${#ips[@]}" -gt 8 ]]; then
+    ips=("${ips[@]:0:8}")
   fi
 
   local ports_csv ports_csv_nospace
@@ -959,6 +1170,10 @@ warp_try_fix_handshake() {
   ports_raw+=("$cur_port")
   mapfile -t ports < <(printf '%s\n' "${ports_raw[@]}" \
     | awk 'NF && $0 ~ /^[0-9]+$/ && $0 >= 1 && $0 <= 65535 && !seen[$0]++')
+  # Ports don't change the exit IP (only reachability); cap them to bound the retry loop.
+  if [[ "${#ports[@]}" -gt 3 ]]; then
+    ports=("${ports[@]:0:3}")
+  fi
 
   [[ "${#ips[@]}" -gt 0 ]] || return 1
   [[ "${#ports[@]}" -gt 0 ]] || return 1
@@ -1024,7 +1239,20 @@ cmd_ns_up() {
 
   write_netns_resolv_conf "$ns"
 
-  ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+  # Egress NAT: if the uplink has multiple public IPv4s, SNAT each tunnel to its own
+  # source IP so the extra addresses are actually used; otherwise MASQUERADE.
+  local egress_ip=""
+  if egress_bind_enabled; then
+    egress_ip="$(egress_ip_for_index "$i" 2>/dev/null || true)"
+  fi
+  if [[ -n "${egress_ip:-}" ]] && is_ipv4 "$egress_ip"; then
+    # Drop any stale MASQUERADE for this subnet, then pin the source IP.
+    ipt_delete_all nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+    ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$egress_ip"
+    log "warp$(printf '%02d' "$i") egress source IP pinned to ${egress_ip}"
+  else
+    ipt_ensure_top nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+  fi
   ipt_ensure_top filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
   ipt_ensure_top filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 
@@ -1036,6 +1264,9 @@ cmd_ns_up() {
     if autorenew_allowed "$i"; then
       warn "warp$(printf '%02d' "$i") handshake failed; attempting auto renew (wgcf re-register) once."
       mark_autorenew_attempt "$i"
+
+      # Desync the herd: if many tunnels fail at boot, avoid hammering Cloudflare in lockstep.
+      sleep $(( (RANDOM % 8) + 1 )) 2>/dev/null || true
 
       if (
         set -euo pipefail
@@ -1074,6 +1305,12 @@ cmd_ns_down() {
   ip netns exec "$ns" wg-quick down "$conf" >/dev/null 2>&1 || true
 
   ipt_delete_all nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j MASQUERADE
+  # Remove any per-IP SNAT rule(s) for this subnet (the source IP may have changed).
+  local _eip
+  while IFS= read -r _eip; do
+    [[ -n "${_eip:-}" ]] || continue
+    ipt_delete_all nat POSTROUTING -s "$sub" -o "$UPLINK_IF" -j SNAT --to-source "$_eip"
+  done < <(list_uplink_ipv4s 2>/dev/null || true)
   ipt_delete_all filter FORWARD -i "$vh" -o "$UPLINK_IF" -j ACCEPT
   ipt_delete_all filter FORWARD -i "$UPLINK_IF" -o "$vh" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
   ipt_delete_all filter FORWARD -i "$UPLINK_IF" -o "$vh" -m state --state RELATED,ESTABLISHED -j ACCEPT
@@ -1149,6 +1386,41 @@ get_exit_ip() {
   return 1
 }
 
+# Exit IPv4 only -- the duplicate-prone address that IPv4-only destinations actually see
+# (WARP shares one IPv4 per colo). This is the right key for de-duplication.
+# Returns 20 if the namespace is missing, 1 if no IPv4 exit could be determined.
+get_exit_ip4() {
+  local ns="$1"
+  if ! netns_exists "$ns"; then
+    return 20
+  fi
+
+  local retries delay max_time url attempt out ip
+  retries="${EXIT_IP_RETRIES:-$EXIT_IP_RETRIES_DEFAULT}"
+  delay="${EXIT_IP_DELAY:-$EXIT_IP_DELAY_DEFAULT}"
+  max_time="${EXIT_IP_MAX_TIME:-$EXIT_IP_MAX_TIME_DEFAULT}"
+  url="${EXIT_IP_URL:-$EXIT_IP_URL_DEFAULT}"
+  [[ "$retries" =~ ^[0-9]+$ ]] || retries="$EXIT_IP_RETRIES_DEFAULT"
+  [[ "$delay" =~ ^[0-9]+$ ]] || delay="$EXIT_IP_DELAY_DEFAULT"
+  [[ "$max_time" =~ ^[0-9]+$ ]] || max_time="$EXIT_IP_MAX_TIME_DEFAULT"
+  [[ -n "${url:-}" ]] || url="$EXIT_IP_URL_DEFAULT"
+  [[ "$retries" -ge 1 ]] || retries=1
+
+  for attempt in $(seq 1 "$retries"); do
+    if out="$(netns_curl "$ns" -4 -fsS --max-time "$max_time" "$url")"; then
+      ip="$(awk -F= '/^ip=/{print $2; exit}' <<<"$out" 2>/dev/null || true)"
+      if [[ -n "${ip:-}" ]] && is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+      fi
+    fi
+    if [[ "$attempt" -lt "$retries" ]] && [[ "$delay" -gt 0 ]]; then
+      sleep "$delay"
+    fi
+  done
+  return 1
+}
+
 cmd_ip() {
   load_config
   local i="${1:?}"
@@ -1183,6 +1455,32 @@ cmd_ips() {
         echo "MISSING_NETNS"
       else
         echo "N/A"
+      fi
+    fi
+  done
+}
+
+# Show the IPv4 exit IP (the address IPv4-only sites see) and flag duplicates inline.
+cmd_ips4() {
+  load_config
+  local i ns ip rc
+  declare -A seen=()
+  for i in $(seq 1 "$COUNT"); do
+    ns="$(ns_name "$i")"
+    printf "warp%02d: " "$i"
+    if ip="$(get_exit_ip4 "$ns")"; then
+      if [[ -n "${seen[$ip]:-}" ]]; then
+        echo "${ip}   <-- duplicate of warp$(printf '%02d' "${seen[$ip]}")"
+      else
+        seen["$ip"]="$i"
+        echo "$ip"
+      fi
+    else
+      rc=$?
+      if [[ "$rc" -eq 20 ]]; then
+        echo "MISSING_NETNS"
+      else
+        echo "no-IPv4-exit"
       fi
     fi
   done
@@ -1331,26 +1629,96 @@ cmd_renew_all() {
   require_root
   load_config
 
-  local i
+  local i failed=0
   for i in $(seq 1 "$COUNT"); do
-    cmd_renew "$i"
+    # Subshell isolates die/exit so one rate-limited tunnel doesn't abort the rest.
+    if ! ( cmd_renew "$i" ); then
+      failed=1
+      warn "warp$(printf '%02d' "$i") renew failed; continuing with the rest."
+    fi
     if [[ "${REGISTER_DELAY:-0}" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
       sleep "$REGISTER_DELAY"
     fi
   done
+  [[ "$failed" -eq 0 ]] || warn "Some tunnels failed to renew. Check: warp-multi status"
+  return 0
 }
 
 cmd_rotate_all() {
   require_root
   load_config
 
-  local i
+  local i failed=0
   for i in $(seq 1 "$COUNT"); do
-    cmd_rotate "$i"
+    # Subshell isolates die/exit so one rate-limited tunnel doesn't abort the rest.
+    if ! ( cmd_rotate "$i" ); then
+      failed=1
+      warn "warp$(printf '%02d' "$i") rotate failed; continuing with the rest."
+    fi
     if [[ "${REGISTER_DELAY:-0}" -gt 0 ]] && [[ "$i" -lt "$COUNT" ]]; then
       sleep "$REGISTER_DELAY"
     fi
   done
+  [[ "$failed" -eq 0 ]] || warn "Some tunnels failed to rotate. Check: warp-multi status"
+  return 0
+}
+
+cmd_dedupe() {
+  require_root
+  load_config
+
+  local max_rounds="${1:-${DEDUPE_ROUNDS:-$DEDUPE_ROUNDS_DEFAULT}}"
+  [[ "$max_rounds" =~ ^[0-9]+$ ]] || max_rounds="$DEDUPE_ROUNDS_DEFAULT"
+  [[ "$max_rounds" -ge 1 ]] || max_rounds=1
+
+  # We de-duplicate on the *IPv4* exit IP: WARP shares one IPv4 per colo (so it repeats),
+  # while each account gets a unique IPv6 (so IPv6 is diverse for free). Rotating a colliding
+  # tunnel re-registers it and targets an unused endpoint prefix to try a different colo.
+  local round
+  for round in $(seq 1 "$max_rounds"); do
+    declare -A ip_owner=()
+    local -a dups=()
+    local i ns ip no_ipv4=0
+    for i in $(seq 1 "$COUNT"); do
+      ns="$(ns_name "$i")"
+      netns_exists "$ns" || continue
+      ip="$(get_exit_ip4 "$ns" 2>/dev/null || true)"
+      if [[ -z "${ip:-}" ]] || ! is_ipv4 "$ip"; then
+        no_ipv4=$((no_ipv4 + 1))
+        continue
+      fi
+      if [[ -n "${ip_owner[$ip]:-}" ]]; then
+        dups+=("$i")
+        log "warp$(printf '%02d' "$i") shares exit IPv4 ${ip} with warp$(printf '%02d' "${ip_owner[$ip]}")"
+      else
+        ip_owner["$ip"]="$i"
+      fi
+    done
+
+    if [[ "$no_ipv4" -gt 0 ]]; then
+      log "Round ${round}: ${no_ipv4} tunnel(s) had no IPv4 exit (IPv6-only egress is already unique per account)."
+    fi
+
+    if [[ "${#dups[@]}" -eq 0 ]]; then
+      log "Round ${round}: all IPv4 exit IPs are unique."
+      return 0
+    fi
+
+    log "Round ${round}: rotating ${#dups[@]} duplicate tunnel(s): ${dups[*]}"
+    local j
+    for j in "${dups[@]}"; do
+      # Subshell isolates die/exit so one failure doesn't abort de-duplication.
+      if ! ( cmd_renew "$j" ); then
+        warn "warp$(printf '%02d' "$j") renew failed during dedupe; continuing."
+      fi
+      if [[ "${REGISTER_DELAY:-0}" -gt 0 ]]; then
+        sleep "$REGISTER_DELAY"
+      fi
+    done
+  done
+
+  warn "After ${max_rounds} round(s) some exit IPs may still repeat (WARP can hand out the same IP). Re-run 'warp-multi dedupe' later or raise DEDUPE_ROUNDS."
+  return 0
 }
 
 cmd_status() {
@@ -1410,6 +1778,8 @@ Options:
   --register-retries N       Retries when Cloudflare returns 429 (default: ${REGISTER_RETRIES_DEFAULT})
   --register-backoff-base S  Exponential backoff base seconds (default: ${REGISTER_BACKOFF_BASE_DEFAULT})
   --register-backoff-max S   Max backoff seconds (default: ${REGISTER_BACKOFF_MAX_DEFAULT})
+  --egress-ip-bind auto|off  Per-IP SNAT when uplink has >=2 IPv4s (default: ${EGRESS_IP_BIND_DEFAULT})
+  --warp-plus-license KEY    Optional WARP+ license key (applied via wgcf; falls back to free WARP)
 
 Examples:
   warp-multi install
@@ -1429,13 +1799,15 @@ Commands:
   down                     Stop all services (keeps configs)
   proxies                  Print SOCKS5 endpoints (for x-ui/xray outbounds)
   ip <i>                   Show exit IP for one tunnel
-  ips                      Show exit IPs for all tunnels
+  ips                      Show exit IPs for all tunnels (IPv6 preferred)
+  ips4                     Show IPv4 exit IPs for all tunnels and flag duplicates
   status                   Show service status + exit IPs
   restart <i|all>          Restart one or all tunnels
   rotate <i>               Regenerate wgcf account/config for one tunnel (changes keys; usually changes exit IP)
   rotate-all               Rotate all tunnels
   renew <i>                Re-register WARP for one tunnel without restarting SOCKS (keeps netns)
   renew-all                Renew all tunnels
+  dedupe [rounds]          Rotate tunnels that share an exit IP until unique (default: ${DEDUPE_ROUNDS_DEFAULT} rounds)
   ns-up <i>                (internal) bring up netns + wg
   ns-down <i>              (internal) bring down netns + wg
   socks <i>                (internal) run SOCKS5 proxy inside netns
@@ -1463,12 +1835,14 @@ main() {
     proxies) cmd_proxies "$@" ;;
     ip) cmd_ip "$@" ;;
     ips) cmd_ips "$@" ;;
+    ips4) cmd_ips4 "$@" ;;
     status) cmd_status "$@" ;;
     restart) cmd_restart "$@" ;;
     rotate) cmd_rotate "$@" ;;
     rotate-all) cmd_rotate_all "$@" ;;
     renew) cmd_renew "$@" ;;
     renew-all) cmd_renew_all "$@" ;;
+    dedupe) cmd_dedupe "$@" ;;
     ns-up) cmd_ns_up "$@" ;;
     ns-down) cmd_ns_down "$@" ;;
     socks) cmd_socks "$@" ;;
