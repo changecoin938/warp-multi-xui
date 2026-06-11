@@ -22,6 +22,11 @@ BALANCER_TAG="${BALANCER_TAG:-proxy-balancer}"
 TAG_PREFIX="${TAG_PREFIX:-px}"
 BALANCER_STRATEGY="${BALANCER_STRATEGY:-random}"   # random | leastPing (leastPing needs observatory)
 
+# x-ui (3x-ui / MHSanaei) integration
+XUI_DB="${XUI_DB:-/etc/x-ui/x-ui.db}"
+XUI_SERVICE="${XUI_SERVICE:-x-ui}"
+XRAY_KEY="${XRAY_KEY:-xrayTemplateConfig}"
+
 log()  { echo "[$(date +'%F %T')] $*"; }
 warn() { echo "WARN: $*" >&2; }
 die()  { echo "ERROR: $*" >&2; exit 1; }
@@ -219,27 +224,131 @@ EOF
   cat "$OUT_JSON"
   echo "-----------------------------------------------------"
   echo
-  echo "Apply it in x-ui:"
-  echo "  Panel -> Xray Configuration -> merge these 'outbounds' and 'routing' sections,"
-  echo "  then replace YOUR_INBOUND_TAG with your real inbound tag and restart Xray."
+
+  # Full automation: if x-ui is on this box, apply straight into the panel.
+  if [[ "${NO_APPLY:-0}" -ne 1 ]] && [[ -f "$XUI_DB" ]]; then
+    log "x-ui detected ($XUI_DB) -> applying automatically..."
+    cmd_apply
+  else
+    echo "x-ui not detected (or --no-apply). Apply manually:"
+    echo "  Panel -> Xray Configs -> merge the 'outbounds' and 'routing' above,"
+    echo "  replace YOUR_INBOUND_TAG with your inbound tag, Save, Restart."
+  fi
+}
+
+# --- x-ui (3x-ui) auto-apply -------------------------------------------------
+
+ensure_apply_tools() {
+  has_cmd sqlite3 || { log "Installing sqlite3..."; apt-get install -y -q sqlite3 >/dev/null 2>&1 || true; }
+  has_cmd jq      || { log "Installing jq...";      apt-get install -y -q jq      >/dev/null 2>&1 || true; }
+  has_cmd sqlite3 || die "sqlite3 is required (apt-get install -y sqlite3)."
+  has_cmd jq      || die "jq is required (apt-get install -y jq)."
+}
+
+# JSON array of enabled inbound tags from the x-ui DB.
+xui_inbound_tags() {
+  sqlite3 "$XUI_DB" "SELECT tag FROM inbounds WHERE enable=1 AND tag IS NOT NULL AND tag<>'';" 2>/dev/null \
+    | jq -R . | jq -s 'map(select(length>0))'
+}
+
+cmd_apply() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Run as root to modify x-ui."
+  ensure_apply_tools
+  [[ -f "$OUT_JSON" ]] || die "No generated config ($OUT_JSON). Run: proxy-multi setup"
+  [[ -f "$XUI_DB" ]]   || die "x-ui DB not found at $XUI_DB (set XUI_DB=/path/to/x-ui.db)."
+
+  # Current Xray template from the panel DB.
+  local tmpl
+  tmpl="$(sqlite3 "$XUI_DB" "SELECT value FROM settings WHERE key='${XRAY_KEY}';" 2>/dev/null || true)"
+  [[ -n "$tmpl" ]] || die "Could not read '${XRAY_KEY}' from $XUI_DB."
+  printf '%s' "$tmpl" | jq empty 2>/dev/null || die "Existing template is not valid JSON; aborting (DB untouched)."
+
+  # Which inbound tags route through the proxies.
+  local intags
+  if [[ -n "${APPLY_INBOUND:-}" && "$APPLY_INBOUND" != "all" ]]; then
+    intags="$(printf '%s' "$APPLY_INBOUND" | tr ',' '\n' | jq -R . | jq -s 'map(select(length>0))')"
+  else
+    intags="$(xui_inbound_tags)"
+  fi
+  [[ "$(printf '%s' "$intags" | jq 'length')" -ge 1 ]] \
+    || die "No enabled inbounds found to route. Create an inbound first, or pass --inbound <tag>."
+
+  # Backup the DB before touching it.
+  local stamp bak
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  bak="${XUI_DB}.proxymulti.${stamp}.bak"
+  cp -f "$XUI_DB" "$bak" || die "DB backup failed; aborting."
+  log "DB backed up: $bak"
+
+  # Merge proxy outbounds + balancer + routing rule into the template (idempotent).
+  local merged
+  merged="$(printf '%s' "$tmpl" | jq \
+    --slurpfile px "$OUT_JSON" \
+    --argjson intags "$intags" \
+    --arg baltag "$BALANCER_TAG" '
+    ($px[0].outbounds) as $pxob
+    | ($pxob | map(.tag)) as $pxtags
+    | ($px[0].routing.balancers) as $pxbal
+    | {type:"field", inboundTag:$intags, balancerTag:$baltag} as $rule
+    | .outbounds = ((.outbounds // []) | map(select(.tag as $t | ($pxtags | index($t)) | not))) + $pxob
+    | .routing = (.routing // {})
+    | .routing.balancers = ((.routing.balancers // []) | map(select(.tag != $baltag))) + $pxbal
+    | .routing.rules = ((.routing.rules // []) | map(select((.balancerTag // "") != $baltag))) + [$rule]
+  ' 2>/dev/null)" || { warn "merge failed"; die "jq merge failed; DB untouched (backup: $bak)."; }
+  printf '%s' "$merged" | jq empty 2>/dev/null || die "Merged config invalid; DB untouched (backup: $bak)."
+
+  # Write the merged template back (stream via stdin; escape single quotes for SQL).
+  printf '%s' "$merged" > "${STATE_DIR}/merged-template.json"
+  if ! { printf "UPDATE settings SET value='"; sed "s/'/''/g" "${STATE_DIR}/merged-template.json"; printf "' WHERE key='%s';" "$XRAY_KEY"; } | sqlite3 "$XUI_DB"; then
+    cp -f "$bak" "$XUI_DB"
+    die "DB write failed; restored backup ($bak)."
+  fi
+  local nprox routed
+  nprox="$(jq '.outbounds | length' "$OUT_JSON" 2>/dev/null || echo '?')"
+  routed="$(printf '%s' "$intags" | jq -cr 'join(", ")' 2>/dev/null || echo '?')"
+  log "x-ui Xray template updated (${nprox} proxies; routing [${routed}] -> ${BALANCER_TAG})."
+
+  # Restart and verify; auto-rollback if the panel fails to come up.
+  systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+  sleep 4
+  if ! systemctl is-active --quiet "$XUI_SERVICE"; then
+    warn "$XUI_SERVICE did not come up; rolling back."
+    cp -f "$bak" "$XUI_DB"
+    systemctl restart "$XUI_SERVICE" >/dev/null 2>&1 || true
+    die "Rolled back to backup. Check: journalctl -u $XUI_SERVICE -e --no-pager"
+  fi
+
+  if pgrep -f 'xray-linux-' >/dev/null 2>&1 || pgrep -x xray >/dev/null 2>&1; then
+    log "Done. Proxy balancer is LIVE in x-ui. Backup: $bak"
+  else
+    warn "Panel is up but no Xray process detected — config may be rejected."
+    warn "Rollback if needed:  cp '$bak' '$XUI_DB' && systemctl restart $XUI_SERVICE"
+  fi
 }
 
 usage() {
   cat <<EOF
-proxy-multi v${VERSION} - build an Xray (x-ui) balancer from a proxy list
+proxy-multi v${VERSION} - turn a proxy list into an Xray (x-ui) balancer, automatically
 
 Usage:
-  proxy-multi setup [--file proxies.txt]   Interactively (or from a file) test proxies
-                                           and generate the Xray balancer config.
+  proxy-multi setup [options]   Ask for proxies, test them, generate the config, and
+                                (if x-ui is on this box) apply it to the panel + restart.
+  proxy-multi apply [options]   Re-apply the last generated config to x-ui.
+
+Options:
+  --file FILE        Read proxies from FILE (one per line) instead of asking.
+  --inbound TAGS     Route only these inbound tags (comma-separated) through the proxies.
+                     Default: all enabled inbounds. Use "all" for the same.
+  --no-apply         Only generate the config; do not touch x-ui.
+  --db PATH          x-ui database path (default: ${XUI_DB}).
 
 Proxy line formats:
-  host:port:user:pass
-  host:port
-  socks5://user:pass@host:port
-  http://user:pass@host:port
+  host:port:user:pass | host:port | socks5://user:pass@host:port | http://user:pass@host:port
 
 Output config: ${OUT_JSON}
-Env knobs: BALANCER_TAG, TAG_PREFIX, BALANCER_STRATEGY (random|leastPing), TEST_TIMEOUT
+Auto-apply is safe: it backs up ${XUI_DB} first and rolls back if x-ui fails to restart.
+Env knobs: BALANCER_TAG, TAG_PREFIX, BALANCER_STRATEGY (random|leastPing), TEST_TIMEOUT,
+           XUI_DB, XUI_SERVICE, XRAY_KEY
 EOF
 }
 
@@ -248,16 +357,22 @@ main() {
   shift || true
 
   PROXY_FILE=""
+  NO_APPLY=0
+  APPLY_INBOUND=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --file) PROXY_FILE="${2:?}"; shift 2 ;;
-      -h|--help) usage; exit 0 ;;
+      --file)     PROXY_FILE="${2:?}"; shift 2 ;;
+      --no-apply) NO_APPLY=1; shift ;;
+      --inbound)  APPLY_INBOUND="${2:?}"; shift 2 ;;
+      --db)       XUI_DB="${2:?}"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
   done
 
   case "$cmd" in
     setup) cmd_setup ;;
+    apply) cmd_apply ;;
     -h|--help|help) usage; exit 0 ;;
     *) die "Unknown command: $cmd (use: proxy-multi --help)" ;;
   esac
