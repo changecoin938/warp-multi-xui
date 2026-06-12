@@ -115,10 +115,10 @@ warp-multi install --warp-plus-license <KEY>
 curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/proxy-multi -o /usr/local/bin/proxy-multi
 chmod +x /usr/local/bin/proxy-multi
 
-proxy-multi setup --rotate 5   # می‌پرسد چند پروکسی؛ تست و خودکار به x-ui وصل می‌کند (چرخش هر ۵ دقیقه)
+proxy-multi setup              # می‌پرسد چند پروکسی؛ تست و خودکار به x-ui وصل می‌کند
 proxy-multi add                # افزودن پروکسی جدید، بدون شروع از صفر
 proxy-multi ips4               # IP خروجی هرکدام + علامت تکراری‌ها
-proxy-multi setup --no-rotate  # خاموش‌کردن چرخش (پخش تصادفی روی همه)
+proxy-multi setup --rotate 5   # (اختیاری) چرخشِ زمانی — هر ۵ دقیقه x-ui ری‌استارت می‌شود ⚠️
 ```
 
 > فرمت هر پروکسی در یک خط: `host:port:user:pass` (یا `host:port`). خروجی = IP دیتاسنتریِ پروکسی؛ بعضی سایت‌ها ممکن است بلاکش کنند.
@@ -136,8 +136,8 @@ proxy-multi setup --no-rotate  # خاموش‌کردن چرخش (پخش تصاد
 curl -fsSL https://raw.githubusercontent.com/changecoin938/warp-multi-xui/main/warp-proxy -o /usr/local/bin/warp-proxy
 chmod +x /usr/local/bin/warp-proxy
 
-warp-proxy setup --rotate 5    # پروکسی‌های SOCKS5 (پورتِ UDP) را می‌پرسد، تونل WARP می‌سازد،
-                               # و خودکار با چرخش هر ۵ دقیقه به x-ui وصل می‌کند
+warp-proxy setup               # پروکسی‌های SOCKS5 (پورتِ UDP) را می‌پرسد، تونل WARP می‌سازد،
+                               # و خودکار به x-ui وصل می‌کند با failover سالم‌محور (بدون ری‌استارت)
 ```
 
 **افزودن پروکسی جدید (بدون شروع از صفر):**
@@ -161,11 +161,16 @@ sleep 2; ./gost -L "udp://127.0.0.1:5301/stun.l.google.com:19302" -F "socks5://$
 sleep 3; grep -q 'UDP tunnel failure' /tmp/g.log && echo "UDP: ❌ پشتیبانی نمی‌شود" || echo "UDP: ✅ احتمالاً اوکی"; pkill -f 'gost -L udp'
 ```
 
+**Failover خودکار (پیش‌فرض):** به‌جای چرخشِ زمانی، x-ui با `leastPing` + health-check (هر ~۱۰ ثانیه) تنظیم می‌شود. اگر پروکسی/تونلی پینگ نداد، **خودکار و ظرف چند ثانیه کنار گذاشته می‌شود** و ترافیک روی تونلِ سالم ادامه می‌یابد — **بدون ری‌استارت x-ui**. پس اگر تونلِ دیگری (مثل **RatHole**) از x-ui رد می‌شود، قطع نمی‌شود.
+
+> ⚠️ `--rotate N` (چرخشِ زمانی) هر دوره **x-ui را ری‌استارت می‌کند** و هر تونلی که از x-ui رد می‌شود (RatHole و …) را لحظه‌ای قطع می‌کند. فقط اگر واقعاً چرخشِ زمانی می‌خواهی استفاده کن؛ وگرنه حالت پیش‌فرض (failover) بهتر است.
+
 **نکته‌های مهم:**
 - تعداد IP وارپِ متفاوت ≈ تعداد **لوکیشن‌های متفاوتِ** پروکسی‌ها (پروکسی‌های یک شهر ممکن است IP یکسان/نزدیک بدهند).
 - موقع راه‌اندازی، تونل‌های `warp-multi` (netns) **stop** می‌شوند تا کلیدهای WARP آزاد شوند (sing-box ازشان استفاده می‌کند).
 - **پورت SOCKS5/UDP** پروکسی را بده، نه پورت HTTP.
-- معماری: `x-ui → SOCKS محلیِ sing-box → WARP(userspace) → پروکسی → IP تمیز وارپ`. sing-box خودکار نصب می‌شود.
+- مصرف منابع کم است: sing-box (Go) + چند درخواست HEAD کوچک برای health-check. دیگر ری‌استارتِ دوره‌ای x-ui نداریم (سبک‌تر از قبل).
+- معماری: `x-ui (leastPing + failover) → SOCKS محلیِ sing-box → WARP(userspace) → پروکسی → IP تمیز وارپ`. sing-box خودکار نصب می‌شود.
 
 ---
 
