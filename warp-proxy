@@ -25,6 +25,9 @@ WARP_PUBKEY="${WARP_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}"
 WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.193.1:2408}"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 ROTATE="${ROTATE:-0}"            # 0 = failover balancer (default, no x-ui restarts); >0 = timed rotation (restarts x-ui)
+# Prefer WARP's UNIQUE IPv6 egress (shared IPv4 triggers Google "I'm not a robot"). "" disables.
+DOMAIN_STRATEGY="${DOMAIN_STRATEGY:-prefer_ipv6}"
+DOH_URL="${DOH_URL:-https://1.1.1.1/dns-query}"
 LOCALS_FILE="${STATE_DIR}/locals.list"
 PROXY_LIST="${PROXY_LIST:-${STATE_DIR}/proxies.list}"
 
@@ -174,9 +177,10 @@ build_and_wire() {
     [[ "$epp" =~ ^[0-9]+$ ]] || { eh="${WARP_ENDPOINT%:*}"; epp="${WARP_ENDPOINT##*:}"; }
     lport=$((BASE_PORT + i)); locals+=("127.0.0.1:${lport}")
     inbounds+=("$(jq -nc --arg t "in$i" --argjson p "$lport" '{type:"socks",tag:$t,listen:"127.0.0.1",listen_port:$p}')")
-    endpoints+=("$(jq -nc --arg t "warp$i" --arg pk "$pk" --arg a4 "$a4" --arg a6 "${a6:-}" --arg det "px$i" --arg eh "$eh" --argjson ep "$epp" --arg pub "$WARP_PUBKEY" \
-      '{type:"wireguard",tag:$t,system:false,mtu:1280,address:([$a4]+(if $a6=="" then [] else [$a6] end)),private_key:$pk,detour:$det,
-        peers:[{address:$eh,port:$ep,public_key:$pub,allowed_ips:["0.0.0.0/0","::/0"]}]}')")
+    endpoints+=("$(jq -nc --arg t "warp$i" --arg pk "$pk" --arg a4 "$a4" --arg a6 "${a6:-}" --arg det "px$i" --arg eh "$eh" --argjson ep "$epp" --arg pub "$WARP_PUBKEY" --arg ds "$DOMAIN_STRATEGY" \
+      '{type:"wireguard",tag:$t,system:false,mtu:1280,address:([$a4]+(if $a6=="" then [] else [$a6] end)),private_key:$pk,detour:$det}
+        + (if $ds=="" then {} else {domain_strategy:$ds} end)
+        + {peers:[{address:$eh,port:$ep,public_key:$pub,allowed_ips:["0.0.0.0/0","::/0"]}]}')")
     if [[ -n "$P_USER" ]]; then
       outbounds+=("$(jq -nc --arg t "px$i" --arg s "$P_HOST" --argjson p "$P_PORT" --arg u "$P_USER" --arg pw "$P_PASS" '{type:"socks",tag:$t,server:$s,server_port:$p,version:"5",username:$u,password:$pw}')")
     else
@@ -190,8 +194,14 @@ build_and_wire() {
   EP="$(printf '%s\n' "${endpoints[@]}" | jq -s .)"
   OUT="$(printf '%s\n' "${outbounds[@]}" | jq -s .)"
   RU="$(printf '%s\n' "${rules[@]}" | jq -s .)"
-  jq -n --argjson inb "$IN" --argjson ep "$EP" --argjson outb "$OUT" --argjson ru "$RU" \
-    '{log:{level:"warn"},inbounds:$inb,endpoints:$ep,outbounds:($outb+[{type:"direct",tag:"direct"}]),route:{rules:$ru}}' > "$SB_CONF"
+  # DNS: prefer IPv6 so traffic exits via WARP's UNIQUE IPv6 (shared IPv4 triggers Google
+  # captcha). DoH over TCP/443 because outbound UDP:53 is often blocked. IPv4 falls back.
+  local dns_block='{}'
+  if [[ -n "$DOMAIN_STRATEGY" ]]; then
+    dns_block="$(jq -nc --arg url "$DOH_URL" --arg st "$DOMAIN_STRATEGY" '{servers:[{tag:"doh",address:$url}],strategy:$st}')"
+  fi
+  jq -n --argjson inb "$IN" --argjson ep "$EP" --argjson outb "$OUT" --argjson ru "$RU" --argjson dns "$dns_block" \
+    '{log:{level:"warn"},dns:$dns,inbounds:$inb,endpoints:$ep,outbounds:($outb+[{type:"direct",tag:"direct"}]),route:{rules:$ru}}' > "$SB_CONF"
   jq empty "$SB_CONF" 2>/dev/null || die "generated sing-box config is invalid."
 
   # systemd service
