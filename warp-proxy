@@ -24,7 +24,7 @@ BASE_PORT="${BASE_PORT:-42000}"
 WARP_PUBKEY="${WARP_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}"
 WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.193.1:2408}"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
-ROTATE="${ROTATE:-5}"            # minutes; 0 = no rotation (balance instead)
+ROTATE="${ROTATE:-0}"            # 0 = failover balancer (default, no x-ui restarts); >0 = timed rotation (restarts x-ui)
 LOCALS_FILE="${STATE_DIR}/locals.list"
 PROXY_LIST="${PROXY_LIST:-${STATE_DIR}/proxies.list}"
 
@@ -236,13 +236,16 @@ EOF
   [[ "$ok" -ge 1 ]] || die "No tunnel came up. Check: journalctl -u ${SB_SERVICE} -e --no-pager"
   log "${ok}/${#locals[@]} WARP-through-proxy tunnels live."
 
-  # wire into x-ui via proxy-multi (balance/rotation across the local WARP SOCKS endpoints)
+  # wire into x-ui via proxy-multi. --no-test wires ALL tunnels (the x-ui health-check
+  # observatory decides liveness at runtime, so a momentarily-down tunnel still gets
+  # included once it recovers — robust failover).
   if has proxy-multi; then
-    log "Wiring into x-ui via proxy-multi (rotation ${ROTATE}m)..."
     if [[ "$ROTATE" -gt 0 ]]; then
-      proxy-multi setup --file "$LOCALS_FILE" --rotate "$ROTATE"
+      log "Wiring into x-ui (timed rotation ${ROTATE}m — restarts x-ui; may disrupt other tunnels)..."
+      proxy-multi setup --file "$LOCALS_FILE" --rotate "$ROTATE" --no-test
     else
-      proxy-multi setup --file "$LOCALS_FILE" --no-rotate
+      log "Wiring into x-ui (leastPing + health-check failover, no x-ui restarts)..."
+      proxy-multi setup --file "$LOCALS_FILE" --no-rotate --no-test
     fi
   else
     echo "proxy-multi not installed. Point x-ui at these local SOCKS5: ${locals[*]}"

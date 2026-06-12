@@ -22,7 +22,9 @@ TEST_TIMEOUT="${TEST_TIMEOUT:-15}"
 
 BALANCER_TAG="${BALANCER_TAG:-proxy-balancer}"
 TAG_PREFIX="${TAG_PREFIX:-px}"
-BALANCER_STRATEGY="${BALANCER_STRATEGY:-random}"   # random | leastPing (leastPing needs observatory)
+BALANCER_STRATEGY="${BALANCER_STRATEGY:-random}"   # used only by the generated OUT_JSON; apply uses leastPing
+# Health-check probe for automatic failover (returns HTTP 204). Detection ~ interval*sampling.
+PROBE_URL="${PROBE_URL:-https://cp.cloudflare.com/generate_204}"
 
 # x-ui (3x-ui / MHSanaei) integration
 XUI_DB="${XUI_DB:-/etc/x-ui/x-ui.db}"
@@ -180,7 +182,13 @@ process_proxies() {
     saved+=("$line")
     idx=$((idx + 1))
     tag="${TAG_PREFIX}$(printf '%02d' "$idx")"
-    if test_proxy "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS" "$P_SCHEME"; then
+    if [[ "${NO_TEST:-0}" -eq 1 ]]; then
+      # Wire without testing — let the x-ui health-check (observatory) decide liveness at runtime.
+      local proto2; proto2="$([[ "$P_SCHEME" == http* ]] && echo http || echo socks)"
+      printf '%-24s %-6s %-16s %-26s %s\n' "${P_HOST}:${P_PORT}" "$proto2" "-" "(untested)" "WIRED ($tag)"
+      outbounds+=("$(gen_outbound "$tag" "$proto2" "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS")")
+      tags+=("$tag")
+    elif test_proxy "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS" "$P_SCHEME"; then
       printf '%-24s %-6s %-16s %-26s %s\n' "${P_HOST}:${P_PORT}" "$T_PROTO" "$T_IP" "${T_GEO:-?}" "OK ($tag)"
       outbounds+=("$(gen_outbound "$tag" "$T_PROTO" "$P_HOST" "$P_PORT" "$P_USER" "$P_PASS")")
       tags+=("$tag")
@@ -322,19 +330,24 @@ cmd_apply() {
   cp -f "$XUI_DB" "$bak" || die "DB backup failed; aborting."
   log "DB backed up: $bak"
 
-  # Build the routing rule + balancer set depending on mode:
-  #   rotate mode -> all traffic to ONE active proxy (the first), a timer cycles it;
-  #   balancer mode -> random load-balance across all proxies.
-  local ourbal ourrule
+  # Routing mode:
+  #   rotate mode (--rotate N)  -> all traffic to ONE proxy, a timer cycles it. NOTE: each
+  #                                cycle restarts x-ui, which briefly drops every connection
+  #                                through it (e.g. a rathole tunnel). Opt-in only.
+  #   failover mode (default)   -> leastPing balancer + health-checked burstObservatory:
+  #                                routes to a healthy proxy, automatically fails over off a
+  #                                dead one, with NO x-ui restarts (no disruption to other tunnels).
+  local ourbal ourrule obs firstpx0
+  firstpx0="$(jq -r '.outbounds[0].tag' "$OUT_JSON" 2>/dev/null || true)"
+  [[ -n "$firstpx0" ]] || firstpx0="${TAG_PREFIX}01"
   if [[ "${ROTATE_MINUTES:-0}" -gt 0 ]]; then
-    local firstpx
-    firstpx="$(jq -r '.outbounds[0].tag' "$OUT_JSON" 2>/dev/null || true)"
-    [[ -n "$firstpx" ]] || die "Could not read first proxy tag from $OUT_JSON."
     ourbal='[]'
-    ourrule="$(jq -nc --argjson intags "$intags" --arg ob "$firstpx" '{type:"field", inboundTag:$intags, outboundTag:$ob}')"
+    ourrule="$(jq -nc --argjson intags "$intags" --arg ob "$firstpx0" '{type:"field", inboundTag:$intags, outboundTag:$ob}')"
+    obs='null'
   else
-    ourbal="$(jq -c '.routing.balancers' "$OUT_JSON" 2>/dev/null || echo '[]')"
+    ourbal="$(jq -nc --arg bt "$BALANCER_TAG" --arg pfx "$TAG_PREFIX" --arg fb "$firstpx0" '[{tag:$bt, selector:[$pfx], fallbackTag:$fb, strategy:{type:"leastPing"}}]')"
     ourrule="$(jq -nc --argjson intags "$intags" --arg bt "$BALANCER_TAG" '{type:"field", inboundTag:$intags, balancerTag:$bt}')"
+    obs="$(jq -nc --arg pfx "$TAG_PREFIX" --arg url "$PROBE_URL" '{subjectSelector:[$pfx], pingConfig:{destination:$url, interval:"10s", sampling:2, timeout:"5s", httpMethod:"HEAD"}}')"
   fi
 
   # Merge into the template (idempotent; cleans up the other mode; preserves existing config).
@@ -343,6 +356,7 @@ cmd_apply() {
     --slurpfile px "$OUT_JSON" \
     --argjson ourbal "$ourbal" \
     --argjson ourrule "$ourrule" \
+    --argjson obs "$obs" \
     --arg baltag "$BALANCER_TAG" \
     --arg pfx "$TAG_PREFIX" '
     ($px[0].outbounds) as $pxob
@@ -353,6 +367,9 @@ cmd_apply() {
           ((.balancerTag // "") != $baltag)
           and (((.outboundTag // "") | test("^"+$pfx+"[0-9]+$")) | not)
       ))) + [$ourrule]
+    | (if $obs == null
+         then (if ((.burstObservatory.subjectSelector // []) == [$pfx]) then del(.burstObservatory) else . end)
+         else .burstObservatory = $obs end)
   ' 2>/dev/null)" || { warn "merge failed"; die "jq merge failed; DB untouched (backup: $bak)."; }
   printf '%s' "$merged" | jq empty 2>/dev/null || die "Merged config invalid; DB untouched (backup: $bak)."
 
@@ -372,9 +389,9 @@ cmd_apply() {
   nprox="$(jq '.outbounds | length' "$OUT_JSON" 2>/dev/null || echo '?')"
   routed="$(printf '%s' "$intags" | jq -cr 'join(", ")' 2>/dev/null || echo '?')"
   if [[ "${ROTATE_MINUTES:-0}" -gt 0 ]]; then
-    log "x-ui template updated (${nprox} proxies; ALL of [${routed}] -> one active proxy, rotating)."
+    log "x-ui template updated (${nprox} proxies; ALL of [${routed}] -> one active proxy, rotating every ${ROTATE_MINUTES}m via restart)."
   else
-    log "x-ui template updated (${nprox} proxies; [${routed}] -> ${BALANCER_TAG} random)."
+    log "x-ui template updated (${nprox} proxies; [${routed}] -> ${BALANCER_TAG} leastPing + health-check failover, no restarts)."
   fi
 
   # Restart and verify; auto-rollback if the panel fails to come up.
@@ -529,12 +546,14 @@ main() {
 
   PROXY_FILE=""
   NO_APPLY=0
+  NO_TEST=0
   APPLY_INBOUND=""
   ROTATE_MINUTES=0
   ROTATE_SET=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --file)      PROXY_FILE="${2:?}"; shift 2 ;;
+      --no-test)   NO_TEST=1; shift ;;
       --no-apply)  NO_APPLY=1; shift ;;
       --inbound)   APPLY_INBOUND="${2:?}"; shift 2 ;;
       --db)        XUI_DB="${2:?}"; shift 2 ;;
