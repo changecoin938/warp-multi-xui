@@ -24,7 +24,11 @@ BALANCER_TAG="${BALANCER_TAG:-proxy-balancer}"
 TAG_PREFIX="${TAG_PREFIX:-px}"
 BALANCER_STRATEGY="${BALANCER_STRATEGY:-random}"   # used only by the generated OUT_JSON; apply uses leastPing
 # Health-check probe for automatic failover (returns HTTP 204). Detection ~ interval*sampling.
+# Timeout is generous because WARP-through-a-distant-proxy adds latency (avoid false "dead").
 PROBE_URL="${PROBE_URL:-https://cp.cloudflare.com/generate_204}"
+PROBE_INTERVAL="${PROBE_INTERVAL:-20s}"
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-12s}"
+PROBE_SAMPLING="${PROBE_SAMPLING:-2}"
 
 # x-ui (3x-ui / MHSanaei) integration
 XUI_DB="${XUI_DB:-/etc/x-ui/x-ui.db}"
@@ -347,7 +351,8 @@ cmd_apply() {
   else
     ourbal="$(jq -nc --arg bt "$BALANCER_TAG" --arg pfx "$TAG_PREFIX" --arg fb "$firstpx0" '[{tag:$bt, selector:[$pfx], fallbackTag:$fb, strategy:{type:"leastPing"}}]')"
     ourrule="$(jq -nc --argjson intags "$intags" --arg bt "$BALANCER_TAG" '{type:"field", inboundTag:$intags, balancerTag:$bt}')"
-    obs="$(jq -nc --arg pfx "$TAG_PREFIX" --arg url "$PROBE_URL" '{subjectSelector:[$pfx], pingConfig:{destination:$url, interval:"10s", sampling:2, timeout:"5s", httpMethod:"HEAD"}}')"
+    obs="$(jq -nc --arg pfx "$TAG_PREFIX" --arg url "$PROBE_URL" --arg iv "$PROBE_INTERVAL" --arg to "$PROBE_TIMEOUT" --argjson sp "$PROBE_SAMPLING" \
+      '{subjectSelector:[$pfx], pingConfig:{destination:$url, interval:$iv, sampling:$sp, timeout:$to, httpMethod:"HEAD"}}')"
   fi
 
   # Merge into the template (idempotent; cleans up the other mode; preserves existing config).
