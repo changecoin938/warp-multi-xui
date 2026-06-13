@@ -13,7 +13,7 @@
 # License: MIT
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 
 STATE_DIR="${STATE_DIR:-/etc/warp-proxy}"
 SB_BIN="${SB_BIN:-/usr/local/bin/sing-box}"
@@ -25,8 +25,10 @@ WARP_PUBKEY="${WARP_PUBKEY:-bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=}"
 WARP_ENDPOINT="${WARP_ENDPOINT:-162.159.193.1:2408}"
 WG_DIR="${WG_DIR:-/etc/wireguard}"
 ROTATE="${ROTATE:-0}"            # 0 = failover balancer (default, no x-ui restarts); >0 = timed rotation (restarts x-ui)
-# Prefer WARP's UNIQUE IPv6 egress (shared IPv4 triggers Google "I'm not a robot"). "" disables.
-DOMAIN_STRATEGY="${DOMAIN_STRATEGY:-prefer_ipv6}"
+# WARP's IPv6 egress is unique per account (dodges Google captcha), BUT on some networks
+# WARP IPv6 routing to certain destinations hangs for minutes -> default OFF (reliable IPv4).
+# Set DOMAIN_STRATEGY=prefer_ipv6 to opt in (test reachability first; see README).
+DOMAIN_STRATEGY="${DOMAIN_STRATEGY:-}"
 DOH_URL="${DOH_URL:-https://1.1.1.1/dns-query}"
 LOCALS_FILE="${STATE_DIR}/locals.list"
 PROXY_LIST="${PROXY_LIST:-${STATE_DIR}/proxies.list}"
@@ -194,8 +196,8 @@ build_and_wire() {
   EP="$(printf '%s\n' "${endpoints[@]}" | jq -s .)"
   OUT="$(printf '%s\n' "${outbounds[@]}" | jq -s .)"
   RU="$(printf '%s\n' "${rules[@]}" | jq -s .)"
-  # DNS: prefer IPv6 so traffic exits via WARP's UNIQUE IPv6 (shared IPv4 triggers Google
-  # captcha). DoH over TCP/443 because outbound UDP:53 is often blocked. IPv4 falls back.
+  # DNS block only when opting into an IPv6 strategy (DOMAIN_STRATEGY=prefer_ipv6): DoH over
+  # TCP/443 (outbound UDP:53 is often blocked). Default empty -> sing-box uses system DNS, IPv4.
   local dns_block='{}'
   if [[ -n "$DOMAIN_STRATEGY" ]]; then
     dns_block="$(jq -nc --arg url "$DOH_URL" --arg st "$DOMAIN_STRATEGY" '{servers:[{tag:"doh",address:$url}],strategy:$st}')"
